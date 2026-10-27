@@ -1,0 +1,32 @@
+# Secrets: never commit. .env.example documents the variables.
+.env
+.env.*
+!.env.example
+
+# Recordings and large data (commit only small fixtures under sample-data/fixtures/)
+*.ndjson
+!sample-data/fixtures/*.ndjson
+recordings/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Java / Maven
+target/
+*.class
+dependency-reduced-pom.xml
+
+# Editors and OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
