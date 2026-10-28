@@ -67,13 +67,37 @@ Labels: **FACT** = measured or observed here; **PRELIMINARY** = measured on too 
 
 The edit-only disorder is already larger than the initial watermark assumption (B = 10 s, ADR-0006). The parameters will be set from the 24-hour data, not from this sample.
 
+### 1.8 Connections drop mid-stream long before 15 minutes (FACT, first ~90 minutes)
+- In the first 90 minutes of the run, **no connection reached Wikimedia's documented 15-minute limit, and none ended cleanly**.
+- Streams broke mid-body with `RemoteProtocolError: incomplete chunked read` after **144, 238, 287, 399, 419, 712 and 802 s** (healthy connections only).
+- There were also 2 read timeouts (no data for 30 s), one of which was the start of the outage below.
+- **Cause unknown.** From one client we can't separate Wikimedia's side from the network path (home router, WSL/Docker NAT). The `connection_lifetime_seconds` histogram, added the same day, measures the 24-hour distribution.
+- **Impact:** none on correctness. Every drop resumed with `Last-Event-ID`. It does mean more boundary duplicates than a 15-minute cadence would produce, and R-1 quantifies that.
+- Reconnect causes were relabelled so routine drops (`stream_interrupted`) can be told apart from real connectivity problems (`connect_error`).
+
+### 1.9 Internet outage recovery (FACT, unplanned)
+- From about 14:12 to 14:20 UTC, the dev machine lost internet access.
+- The producer logged 17 `ConnectError` (DNS: "Name or service not known") reconnects, with full-jitter backoff waits growing from 0.3 s to a maximum of 57 s (cap 60 s).
+- On recovery it resumed with `Last-Event-ID` and caught up **20,423 events in 84 s**, with no gap and **0 delivery errors**: 178,746 of 178,769 received events were acknowledged, and the remaining 23 were in flight at the moment of the reading.
+
+### 1.10 Startup race against a cold broker (FACT, CI)
+- In GitHub Actions, reading the resume position failed once with `_DESTROY_BROKER`.
+- librdkafka retires its bootstrap connection after learning the broker's advertised address, and a request still in flight on it fails.
+- It never happened against the warm local broker, nor against a freshly started local one.
+- **Fix:** transient errors are retried with backoff (`kafka_position.with_retries`). CI has been green since.
+
+### 1.11 Planned interruptions during the 24-hour run
+| Time (UTC) | Event | Why |
+|---|---|---|
+| 2026-10-28 14:43:32 | Producer container replaced (graceful SIGTERM, resume from Kafka) | Deploy the reconnect-label and startup-retry fixes |
+
 ## 2. 24-hour results
 
 ⏳ **Pending.** The run started 2026-10-28 13:09:37 UTC. This section will contain the output of `analyze_raw_topic.py` over the full window:
 - R-1 duplicates by cause;
 - R-2 disorder by hour and type;
 - R-3, R-5 and R-6;
-- connection lifetimes (expected about 15 min);
+- connection lifetimes (from `sp-connection` spans, plus the producer's `connection_lifetime_seconds` histogram);
 - receive delay;
 - any interruptions, such as laptop sleep, and how resume handled them.
 

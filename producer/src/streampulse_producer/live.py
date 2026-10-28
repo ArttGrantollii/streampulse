@@ -1,7 +1,9 @@
 """Live source: Wikimedia EventStreams over SSE, with reconnect and resume.
 
-Wikimedia closes every connection after about 15 minutes (Research 0001), so a
-reconnect is normal operation, not an error. Resume rules:
+Reconnects are normal operation, not errors: Wikimedia closes connections after
+at most 15 minutes, and in practice (2026-10-28) streams dropped mid-body every
+2-13 minutes (Research 0002). Reconnect causes are labelled precisely
+(see classify_transport_error) and connection lifetimes are recorded. Resume rules:
 - first connection: `?since=<ISO-8601>` if the raw topic gave us a position, else "now".
   The value must be ISO-8601: Wikimedia silently ignores a `since` it cannot parse
   (e.g. epoch milliseconds) and streams from the *oldest* retained event instead,
@@ -49,6 +51,17 @@ class UpstreamStatusError(Exception):
         super().__init__(f"HTTP {status}")
         self.status = status
         self.retry_after_s = retry_after_s
+
+
+def classify_transport_error(error: httpx.TransportError) -> str:
+    """Reconnect cause for a transport failure. Order matters: ConnectTimeout is a TimeoutException."""
+    if isinstance(error, httpx.ConnectError | httpx.ConnectTimeout):
+        return "connect_error"  # DNS failure, refused, unreachable: no connection was made
+    if isinstance(error, httpx.TimeoutException):
+        return "timeout"  # connected, but no data within the read timeout
+    if isinstance(error, httpx.RemoteProtocolError | httpx.ReadError):
+        return "stream_interrupted"  # connection dropped mid-stream (e.g. incomplete chunked read)
+    return "network_error"
 
 
 def _retry_after_seconds(response: httpx.Response) -> float | None:
@@ -102,18 +115,19 @@ class LiveSource:
                 cause = "server_closed"
             except UpstreamStatusError as error:
                 cause, retry_after_s = f"http_{error.status}", error.retry_after_s
-            except httpx.TimeoutException:
-                cause = "timeout"
-            except httpx.TransportError as error:  # connection reset, DNS, protocol errors
-                cause = "network_error"
-                self._log.warning("upstream_transport_error", error=repr(error), error_category="network")
+            except httpx.TransportError as error:
+                cause = classify_transport_error(error)
+                self._log.warning(
+                    "upstream_transport_error", cause=cause, error=repr(error), error_category="network"
+                )
 
             if self._stop.is_set():
                 return
             lived_s = self._clock() - started
             self._metrics.reconnects.labels(cause=cause).inc()
-            # A connection that worked for a while resets the backoff: a routine 15-minute
-            # close reconnects immediately; repeated quick failures back off exponentially.
+            self._metrics.connection_lifetime.observe(lived_s)
+            # A connection that worked for a while resets the backoff and reconnects at once;
+            # repeated quick failures back off exponentially.
             if lived_s >= self._healthy_connection_s and received:
                 self._backoff.reset()
                 delay = 0.0

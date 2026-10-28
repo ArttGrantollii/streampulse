@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from streampulse_producer.backoff import Backoff
-from streampulse_producer.live import LiveSource, ResumeMismatchError
+from streampulse_producer.live import LiveSource, ResumeMismatchError, classify_transport_error
 
 
 def sse(*events: tuple[str, str]) -> bytes:
@@ -111,7 +111,7 @@ def test_network_errors_are_retried(metrics, registry):
     upstream = ScriptedUpstream([refuse, ok(sse(("id-1", "{}")))], stop)
     events = list(make_source(metrics, upstream, stop, backoff=ZeroBackoff()).events())
     assert [e.sse_id for e in events] == ["id-1"]
-    assert registry.get_sample_value("streampulse_producer_reconnects_total", {"cause": "network_error"}) == 1
+    assert registry.get_sample_value("streampulse_producer_reconnects_total", {"cause": "connect_error"}) == 1
 
 
 def test_non_message_events_are_not_published(metrics):
@@ -160,3 +160,49 @@ def test_first_event_slightly_before_since_is_accepted(metrics):
     stop = threading.Event()
     upstream = ScriptedUpstream([ok(sse_with_upstream_ts(1_793_190_752_415 - 1_000))], stop)
     assert len(list(make_source(metrics, upstream, stop, since_ms=1_793_190_752_415).events())) == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "cause"),
+    [
+        (httpx.ConnectError("Name or service not known"), "connect_error"),
+        (httpx.ConnectTimeout("connect timed out"), "connect_error"),  # a TimeoutException subclass
+        (httpx.ReadTimeout("no data"), "timeout"),
+        (httpx.RemoteProtocolError("incomplete chunked read"), "stream_interrupted"),
+        (httpx.ReadError("connection reset"), "stream_interrupted"),
+        (httpx.WriteError("broken pipe"), "network_error"),
+    ],
+)
+def test_transport_errors_are_labelled_by_what_happened(error, cause):
+    assert classify_transport_error(error) == cause
+
+
+class DropsMidStream(httpx.SyncByteStream):
+    """Delivers some bytes, then fails like the observed 'incomplete chunked read'."""
+
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def __iter__(self):
+        yield self.body
+        raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
+
+def test_mid_stream_drop_keeps_delivered_events_and_resumes_after_the_last_one(metrics, registry):
+    stop = threading.Event()
+    upstream = ScriptedUpstream(
+        [
+            lambda _r: httpx.Response(200, stream=DropsMidStream(sse(("id-1", "{}"), ("id-2", "{}")))),
+            ok(sse(("id-3", "{}"))),
+        ],
+        stop,
+    )
+    events = list(make_source(metrics, upstream, stop, backoff=ZeroBackoff()).events())
+    assert [e.sse_id for e in events] == ["id-1", "id-2", "id-3"]
+    assert upstream.requests[1].headers["last-event-id"] == "id-2"
+    assert (
+        registry.get_sample_value("streampulse_producer_reconnects_total", {"cause": "stream_interrupted"})
+        == 1
+    )
+    # Only connections that *ended* are recorded; the second is still open when we stop.
+    assert registry.get_sample_value("streampulse_producer_connection_lifetime_seconds_count") == 1

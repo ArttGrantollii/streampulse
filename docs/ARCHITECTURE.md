@@ -167,7 +167,7 @@ flowchart LR
 | Endpoint | `https://stream.wikimedia.org/v2/stream/recentchange` (FACT) |
 | Protocol | SSE over chunked HTTP. The `id:` is a JSON array of `{topic, partition, timestamp}` per upstream DC topic (FACT) |
 | Resume | `Last-Event-ID` header or `?since=`. 7–31 days of history (FACT) |
-| Connection lifetime | Closed by WMF after **15 minutes**. Reconnecting is routine (FACT) |
+| Connection lifetime | Closed by WMF after at most **15 minutes** (FACT, docs). **Observed 2026-10-28:** streams dropped mid-body every 2–13 min and never closed cleanly; cause (upstream vs network path) still to be measured ([Research 0002 §1.8](research/0002-ingestion-behaviour.md)). Reconnecting is routine |
 | Filtering | Client-side only (FACT) |
 | Canary events | `meta.domain == "canary"`, several per hour. Discard them (FACT) |
 | Contract | JSON Schema `mediawiki/recentchange` 1.0.1. Only `$schema`, `meta.dt` and `meta.stream` are required, and `additionalProperties: true` (FACT) |
@@ -182,7 +182,7 @@ flowchart LR
 
 ## 5. Producer
 
-✅ Implemented in Phase 2 ([`producer/`](../producer/)). 64 tests: 55 unit, 9 against the real broker. Decisions: [ADR-0005](adr/0005-serialization-and-schema-contracts.md), [ADR-0012](adr/0012-producer-resume-from-kafka.md). Evidence: [Research 0002](research/0002-ingestion-behaviour.md).
+✅ Implemented in Phase 2 ([`producer/`](../producer/)). 74 tests: 65 unit, 9 against the real broker; all green in CI. Decisions: [ADR-0005](adr/0005-serialization-and-schema-contracts.md), [ADR-0012](adr/0012-producer-resume-from-kafka.md). Evidence: [Research 0002](research/0002-ingestion-behaviour.md).
 
 **What and why:** a small Python service that turns the volatile SSE source into durable Kafka records, and replays recordings through the same publishing path.
 
@@ -206,10 +206,10 @@ flowchart LR
 |---|---|
 | `sse.py` | WHATWG-conformant incremental SSE parser: multi-line data, comments, persistent `id`, `retry` |
 | `envelope.py` | Peeks at the payload for the key, `meta.dt` and canary flag only; never modifies or drops it |
-| `live.py` | Connect, stream and reconnect; backoff with full jitter; `since` sent as ISO-8601; checks that the first event matches the requested `since` |
+| `live.py` | Connect, stream and reconnect; backoff with full jitter; `since` sent as ISO-8601; checks that the first event matches the requested `since`; labels each reconnect by what happened (`classify_transport_error`) |
 | `replay.py` | Pacing by recorded timing ×speed, fixed rate, or unpaced |
 | `publisher.py` | Produce with key, headers and timestamp; blocks on a full local queue (backpressure); counts acks and failures; `flush()` raises on any failure |
-| `resume.py`, `kafka_position.py` | Resume decision from the raw topic's last records (pure function plus Kafka reader) |
+| `resume.py`, `kafka_position.py` | Resume decision from the raw topic's last records (pure function plus Kafka reader). Transient Kafka errors are retried with backoff (`with_retries`), because CI exposed a startup race (`_DESTROY_BROKER`) |
 | `clock.py` | SNTP clock-offset probe, exported as a metric |
 | `app.py`, `cli.py` | Wiring, signals and settings; every option also comes from `STREAMPULSE_*` env vars |
 
@@ -235,7 +235,8 @@ flowchart LR
 - `events_received` and `events_produced` by mode;
 - `produce_errors` by reason;
 - `local_queue_full`;
-- `reconnects` by cause (`server_closed`, `timeout`, `network_error`, `http_<status>`);
+- `reconnects` by cause: `server_closed` (clean end), `stream_interrupted` (dropped mid-body), `connect_error` (DNS, refused, connect timeout), `timeout` (no data for 30 s), `network_error`, `http_<status>`;
+- `connection_lifetime_seconds` (histogram; Wikimedia's documented maximum is 900 s);
 - `produce_latency_seconds` (histogram, aggregatable);
 - `source_delay_seconds` (receive − `meta.dt`; includes clock offset and, during a catch-up, the backlog's age);
 - `unparseable_events`, `canary_events`;
@@ -254,6 +255,8 @@ All names carry the `streampulse_producer_` prefix.
 - **Kafka down:** the client retries until `delivery.timeout.ms` (2 min). A full local queue blocks reading upstream (backpressure). A failed delivery makes `flush()` raise and the producer exit 1; Compose restarts it, and it resumes from Kafka's last position.
 - **Producer crash:** in-flight records are lost from Kafka but re-fetched on resume (overlap = margin).
 - **Wikimedia ignores or misreads the resume request:** detected at the first event (guard), and the producer stops instead of ingesting the wrong period.
+- **Internet outage (observed 2026-10-28, about 8 min):** DNS failures (`connect_error`), backoff with jittered waits capped at 60 s, then a `Last-Event-ID` resume caught up 20,423 events in 84 s with no gap.
+- **Kafka not fully ready at startup:** transient errors are retried (5 attempts, exponential backoff); anything else stops the producer.
 
 **At production scale:** run it as a single active instance with leader election, or partition by upstream stream. Its health is part of the SLO. An internal WMF team would consume Kafka directly instead of SSE.
 

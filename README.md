@@ -55,7 +55,7 @@ make help          # all commands
 - **Producer** ([ARCHITECTURE §5](docs/ARCHITECTURE.md#5-producer)): live, replay and record modes through one publishing path.
   - Kafka settings: idempotent, `acks=all`, zstd, Java-compatible partitioning (verified against Kafka's own murmur2 test vectors).
   - Resumes from the position stored in Kafka, with guards added after a [real incident](docs/adr/0012-producer-resume-from-kafka.md) in which Wikimedia silently ignored a malformed `since` and streamed 8-day-old data.
-  - 64 tests; CI on every push.
+  - 74 tests (65 unit, 9 against a real broker); CI on every push.
 - **Source validation from live data:** [Research 0001](docs/research/0001-eventstreams-source-validation.md). A 2-minute capture overturned four assumptions: the stream covers all Wikimedia projects (not just Wikipedia), `recentchange` has no page IDs, `meta.dt` is emission time rather than edit time, and most events are not edits.
 - **Verified version baseline:** [COMPATIBILITY.md](docs/COMPATIBILITY.md).
 - **Architecture:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Decisions: [docs/adr/](docs/adr/README.md).

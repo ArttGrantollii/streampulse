@@ -656,24 +656,51 @@ What happens to key placement if you later add partitions?
 
 ### Source behaviour
 
-**Question:** Wikimedia closes your connection every 15 minutes. How do you handle that, and what does it cost?
+**Question:** Wikimedia's docs say connections are closed after 15 minutes. How do you handle reconnects, and what did you actually observe?
 
-**Difficulty:** Intermediate
+**Difficulty:** Intermediate / Advanced
 
 **Interview-ready answer:**
-It's treated as routine, not as an error. If a connection lived at least 60 seconds and delivered events, the producer resets its backoff and reconnects immediately, sending `Last-Event-ID`. Only quick, repeated failures back off exponentially with full jitter, up to 60 seconds, and an HTTP `Retry-After` is honoured. The cost is small duplicate overlaps. The SSE id holds a millisecond *timestamp*, not an offset, and I found three cases in 120 events where several events share one id. Resuming re-delivers the events in that millisecond.
+Reconnects are treated as routine. If a connection lived at least 60 seconds and delivered events, the producer resets its backoff and reconnects immediately with `Last-Event-ID`. Only quick, repeated failures back off exponentially with full jitter, up to 60 seconds, and `Retry-After` is honoured. What I observed didn't match the docs: in the first 90 minutes, **no connection reached 15 minutes and none closed cleanly**. Streams broke mid-body ("incomplete chunked read") after 2 to 13 minutes. I relabelled the reconnect metric so routine drops are distinguishable from real outages, and added a connection-lifetime histogram so the 24-hour run measures the distribution instead of assuming it.
 
 **Deep technical explanation:**
-Full jitter, a uniform random wait between 0 and the exponential ceiling, prevents synchronised retry storms when many clients fail together. Every reconnect is counted by cause (`server_closed`, `timeout`, `network_error`, `http_<status>`), and records carry `sp-connection`, so the 24-hour analysis can attribute each duplicate to a reconnect or a restart.
+- **"At most 15 minutes" is a limit, not a schedule.** With a single client I can't tell whether the drops come from Wikimedia or from the network path (home router, WSL/Docker NAT). The lifetime histogram plus a run from a second network would separate them.
+- **Labelling depends on exception order.** httpx's `ConnectTimeout` is a subclass of `TimeoutException`, so connect errors have to be classified first.
+- **The cost of each reconnect is a small duplicate overlap.** The SSE id holds a millisecond *timestamp*, not an offset; I found 3 cases in 120 events where several events share one id, so a resume re-delivers that millisecond. Records carry `sp-connection`, so the analysis attributes every duplicate to a reconnect or a restart.
+- **Full jitter** (a uniform random wait between 0 and the exponential ceiling) prevents synchronised retry storms.
 
 **How StreamPulse demonstrates this:**
-[`live.py`](../producer/src/streampulse_producer/live.py), [`backoff.py`](../producer/src/streampulse_producer/backoff.py), and `test_long_healthy_connection_resets_backoff` / `test_http_errors_back_off_and_are_counted_by_status` in the tests. The 24-hour duplicate counts are in Research 0002 §2 (pending).
+`classify_transport_error` in [`live.py`](../producer/src/streampulse_producer/live.py), [`backoff.py`](../producer/src/streampulse_producer/backoff.py), `test_mid_stream_drop_keeps_delivered_events_and_resumes_after_the_last_one`, and [Research 0002 §1.8–1.9](research/0002-ingestion-behaviour.md). That includes an unplanned 8-minute internet outage: DNS failures, jittered backoff, then 20,423 events caught up in 84 s with no gap.
 
 **Potential follow-up question:**
 Why not run two producers in parallel for redundancy?
 
 **Follow-up answer:**
 Each would write the full stream, doubling every record. It would work, since dedup by `meta.id` removes the copies, but it doubles Kafka volume and dedup state to protect against something resume already handles. Production systems use active-passive with leader election instead. I'd only consider active-active if the requirement was zero ingestion gap even during a producer restart.
+
+---
+
+**Question:** A test passed on your machine but failed in CI. How did you debug it without access to the logs?
+
+**Difficulty:** Intermediate / Advanced
+
+**Interview-ready answer:**
+The producer's integration tests passed locally, even against a freshly started local broker, but failed in GitHub Actions, and I couldn't read the job logs. Instead of guessing, I made failures visible: CI now turns pytest's failure summary into `::error` annotations, which appear on the commit and are readable through the public checks API. The next run showed `_DESTROY_BROKER` while reading the resume position. librdkafka retires its bootstrap connection once it learns the broker's advertised address, and a request in flight on it fails. It was a race only a slow, cold runner hit. It was in *production* code, so the producer could have crashed at startup. I added bounded retries for transient Kafka errors, with unit tests, and CI went green.
+
+**Deep technical explanation:**
+- **Classify, then retry:** retry only errors that mean "try again" (`_DESTROY_BROKER`, `_TRANSPORT`, `_TIMED_OUT`, leader changes, or anything librdkafka marks `retriable()`). Retrying everything hides real errors.
+- **Bound the retries** (5 attempts, exponential backoff) and re-raise afterwards, so a broken setup still fails loudly.
+- **Remove unnecessary dependencies on timing:** the test consumer switched from `subscribe()` (consumer-group coordination) to `assign()` (explicit partitions).
+- **Treat environment differences as data:** CPU speed, cold caches and network timing are part of "the environment". A race that never shows locally is still a bug.
+
+**How StreamPulse demonstrates this:**
+`with_retries` in [`kafka_position.py`](../producer/src/streampulse_producer/kafka_position.py) and its tests, the "Annotate failures" step in [`ci.yml`](../.github/workflows/ci.yml), and [Research 0002 §1.10](research/0002-ingestion-behaviour.md).
+
+**Potential follow-up question:**
+How would you make such races reproducible?
+
+**Follow-up answer:**
+Inject the fault deterministically: a fake that raises the transient error first (which my unit test does). Add network shaping in integration tests (latency, dropped connections, e.g. with Toxiproxy), run integration tests many times in CI to surface flakiness, and record which tests are flaky rather than silently re-running them.
 
 ---
 

@@ -207,8 +207,8 @@ Phase 2: the Python producer that makes Wikimedia's live stream durable in Kafka
   - an SNTP clock-offset probe;
   - Prometheus metrics and structured JSON logs.
 - **A Docker image and an opt-in Compose service** (`make ingest`), with health check and graceful stop.
-- **64 tests:**
-  - 55 unit tests, including a scripted fake upstream for reconnects, HTTP errors and resume;
+- **74 tests:**
+  - 65 unit tests, including a scripted fake upstream for reconnects, mid-stream drops, HTTP errors and resume;
   - 9 integration tests against the real broker: byte-for-byte replay, Java-compatible partitioning, and resume from real records.
 - **GitHub Actions CI:**
   - producer lint and unit tests;
@@ -245,6 +245,10 @@ Phase 2: the Python producer that makes Wikimedia's live stream durable in Kafka
 6. **A diagnostic that could only ever say 0:** "duplicates within a run" was computed from a dict, whose keys are unique by construction. I discarded that number rather than reporting it.
 7. **Analysis skewed by a catch-up.** Receive − `meta.dt` came out at a median of 238 s because a restart's backlog was included.
 8. **The scratchpad recording from Phase 0 was gone after a reboot,** so the fixture had to be re-captured.
+9. **The integration tests failed in CI but passed locally,** even against a fresh broker. The job logs need authentication I didn't have.
+10. **CI then showed a real startup race:** `_DESTROY_BROKER` ("broker handle destroyed without termination") while reading the resume position.
+11. **Reconnect metric mislabelled.** Wikimedia's disconnects were counted as `network_error`. The logs also showed that **no connection reached the documented 15 minutes, and none closed cleanly**: streams broke mid-body after 144–802 s.
+12. **An internet outage of about 8 minutes** during the run, which was unplanned.
 
 ### How we solved them
 1. Probed Wikimedia directly. ISO was honoured to within 0.0 s; epoch ms was off by −712,330 s, the start of retention. Fixed the format, added a check that the first event matches the requested `since` (else exit 1) and a 24 h maximum resume age (else exit 2), replaced the wrong test, and truncated the polluted records with `kafka-delete-records` before the 24-hour run. Documented as an incident in ADR-0012.
@@ -255,9 +259,13 @@ Phase 2: the Python producer that makes Wikimedia's live stream durable in Kafka
 6. Recorded the defect; within-connection duplicates are measured by the analysis tool instead.
 7. The tool now treats each connection as catching up until its events are fresh (< 10 s), and measures steady-state delay after that: p50 256 ms, p99 5.4 s.
 8. Captured 20 s of fresh data with the committed research script. The fixture is now committed, so it can't be lost again.
+9. Made failures readable without logs: CI now turns pytest's failure summary into `::error` annotations, which are public through the checks API. The test consumer also switched from `subscribe()` to `assign()`, removing a dependence on consumer-group coordination.
+10. The annotation showed the cause. librdkafka retires its bootstrap connection once it learns the broker's advertised address, and a request in flight on it fails. That is production code, not just the test: the producer could crash at startup on a cold broker. Added `with_retries` for transient Kafka errors (5 attempts, exponential backoff, anything else re-raised), with unit tests. CI went green.
+11. Replaced the single label with causes that say what happened (`stream_interrupted`, `connect_error`, `timeout`, `server_closed`, `network_error`), checking httpx's exception hierarchy first, since `ConnectTimeout` is a `TimeoutException`. Added a `connection_lifetime_seconds` histogram, so the 24-hour run measures lifetimes instead of us assuming 15 minutes. Added a test that reproduces the mid-stream drop.
+12. No fix was needed. The producer backed off with jittered waits (0.3–57 s, capped at 60 s), then resumed with `Last-Event-ID` and caught up 20,423 events in 84 s, with no gap and no delivery errors. That's a free real-world test of the reconnect design.
 
 ### How we verified the work
-- `uv run pytest`: **64 passed** (55 unit, 9 integration against Kafka 4.2.2). `ruff check` and `ruff format --check` are clean. ShellCheck is clean.
+- `uv run pytest`: **74 passed** (65 unit, 9 integration against Kafka 4.2.2). **CI green** on all four jobs. `ruff check` and `ruff format --check` are clean. ShellCheck is clean.
 - **Live, against Wikimedia:**
   - SIGTERM after 40 s: exit 0, all 1,598 events in Kafka.
   - Restart: resumed from an ISO position, overlap exactly 30.0 s, 949 duplicates, no gap.
@@ -279,3 +287,5 @@ Phase 2: the Python producer that makes Wikimedia's live stream durable in Kafka
 3. Make the system of record cleanable, and clean it before measuring.
 4. Every header you add for observability (here `sp-connection`) pays off the first time something goes wrong.
 5. Measure where the mechanism operates: watermarks are per partition, and analytics are about edits.
+6. "Works on my machine" includes timing. A cold CI runner found a race a warm laptop never hit, and making failures visible (annotations) was the fastest way to find it.
+7. Documented limits aren't typical behaviour. "At most 15 minutes" turned out to be "every few minutes" in practice, so measure the distribution.

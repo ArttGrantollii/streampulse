@@ -48,7 +48,7 @@ The first draft had 12 phases. It was cut to **6** to make sure the project ship
   - a forced disconnect resumes without gaps;
   - `docs/research/0002-*` is published.
 - **Status (2026-10-28):**
-  - ✅ 55 unit tests and 9 integration tests;
+  - ✅ 65 unit tests and 9 integration tests, green in CI;
   - ✅ restart resume measured (overlap = margin, no gap);
   - ✅ graceful `docker stop`;
   - ✅ CI workflow;
