@@ -7,11 +7,12 @@ the StreamPulse topics and can run while live ingestion is going on.
 import json
 import os
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 
 import pytest
-from confluent_kafka import Consumer, Producer
+from confluent_kafka import OFFSET_BEGINNING, Consumer, Producer, TopicPartition
 from confluent_kafka.admin import AdminClient, NewTopic
 
 from streampulse_producer.app import Settings, run
@@ -81,26 +82,22 @@ def topic() -> Iterator[str]:
     admin.delete_topics([name])[name].result(15)
 
 
-def consume_all(topic: str, expected: int, timeout_s: float = 20.0) -> list:
-    consumer = Consumer(
-        {
-            "bootstrap.servers": BOOTSTRAP,
-            "group.id": f"test-{uuid.uuid4().hex}",
-            "auto.offset.reset": "earliest",
-            "enable.auto.commit": False,
-        }
-    )
-    consumer.subscribe([topic])
+def consume_all(topic: str, expected: int, timeout_s: float = 60.0) -> list:
+    """Read every record of `topic` from the start.
+
+    Uses assign() with explicit partitions, not subscribe(): no consumer-group
+    coordination, so it does not depend on how quickly a freshly started broker
+    can create __consumer_offsets and elect a group coordinator.
+    """
+    consumer = Consumer({"bootstrap.servers": BOOTSTRAP, "group.id": "unused", "enable.auto.commit": False})
+    consumer.assign([TopicPartition(topic, p, OFFSET_BEGINNING) for p in range(PARTITIONS)])
     messages = []
+    deadline = time.monotonic() + timeout_s
     try:
-        deadline = threading.Event()
-        timer = threading.Timer(timeout_s, deadline.set)
-        timer.start()
-        while len(messages) < expected and not deadline.is_set():
+        while len(messages) < expected and time.monotonic() < deadline:
             message = consumer.poll(0.5)
             if message is not None and message.error() is None:
                 messages.append(message)
-        timer.cancel()
     finally:
         consumer.close()
     return messages

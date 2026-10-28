@@ -56,8 +56,20 @@ jobs:
 
       - run: uv sync --locked
         working-directory: producer
-      - run: uv run pytest -m integration -v
+
+      # -rfE prints one "FAILED test - reason" line per failure; tee keeps it for the step below.
+      - name: Integration tests
         working-directory: producer
+        run: |
+          set -o pipefail
+          uv run pytest -m integration -v -rfE 2>&1 | tee pytest.log
+
+      # Surface failures as annotations on the commit, readable without opening the log.
+      - name: Annotate failures
+        if: failure()
+        working-directory: producer
+        run: |
+          grep -E '^(FAILED|ERROR) ' pytest.log | while read -r line; do echo "::error title=Integration test::${line}"; done || true
 
       - name: Kafka logs on failure
         if: failure()
