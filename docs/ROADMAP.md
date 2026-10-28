@@ -56,7 +56,7 @@ The first draft had 12 phases. It was cut to **6** to make sure the project ship
   - ⏳ The 24-hour section of Research 0002 is due after 2026-10-29 13:10 UTC.
 - **Change from plan: no Testcontainers.** Integration tests run against the *same* pinned broker and topic setup as development (`docker compose up kafka kafka-init`, locally and in CI). That's one fewer framework, and it tests the real configuration rather than a look-alike.
 
-## Phase 3 — Correct stream processing ⏳
+## Phase 3 — Correct stream processing 🔜
 - **Goal:** the Java Flink job.
   - Parse and validate into `EditEvent`, with a DLQ carrying the reason, and a canary filter.
   - Event time and watermarks using the measured parameters ([ADR-0006](adr/0006-event-time-and-watermarks.md)).
@@ -71,6 +71,16 @@ The first draft had 12 phases. It was cut to **6** to make sure the project ship
   - a fixture replay yields exactly the expected window counts;
   - **replaying the same fixture twice leaves the tables identical**;
   - CI runs the Java tests.
+- **Subphases** (adopted 2026-10-28). Each ends with tests, green CI, a commit, a short journal entry and a stop for review. The full phase wrap-up comes at the end.
+
+  | Step | Builds | Done when |
+  |---|---|---|
+  | **3a** ✅ | `EditEvent` contract, parser/validator, DLQ record schema (plain Java, no cluster) | Unit tests for every rejection reason and the real edge cases (2005 timestamp, unknown fields); the fixture parses; `EditEvent` uses Flink's POJO serializer, not Kryo |
+  | **3b** | Flink job: Kafka source → parse → DLQ sink; canary filter | Mini-cluster integration test; runs on the live raw topic; an injected malformed record lands in the DLQ with its reason |
+  | **3c** | Event time and watermarks from the 24-hour parameters; first 1-minute window to logs | Out-of-order tests; watermark visible in the Flink UI |
+  | **3d** | Dedup (`meta.id`, TTL) and allowed lateness → `late.v1` | Operator-harness tests with injected duplicates and late events |
+  | **3e** | PostgreSQL schema, upsert sink, `dim_wiki` | Replaying the same fixture twice leaves identical tables |
+  | **3f** | Minimal Grafana dashboard; Phase 3 wrap-up | Real numbers visible; full docs pass |
 
 ## Phase 4 — Breaking-news detection (the headline) ⏳
 - **Goal:**

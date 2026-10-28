@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ArttGrantollii/streampulse/schemas/streampulse/dlq-record.v1.json",
+  "title": "StreamPulse DLQ record, version 1",
+  "description": "A raw record the Flink job rejected, written to wikimedia.recentchange.dlq.v1. Changes within v1 are additive only (docs/adr/0005).",
+  "type": "object",
+  "required": ["schema_version", "reason", "detail", "raw_value", "raw_value_bytes", "raw_value_truncated", "source", "job_version", "detected_at_ms"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "reason": {
+      "description": "Machine-readable rejection category (docs/ARCHITECTURE.md §13).",
+      "enum": ["invalid_json", "missing_identity", "missing_time", "impossible_time", "incompatible_type"]
+    },
+    "detail": { "description": "Human-readable explanation, e.g. which field and why.", "type": "string" },
+    "raw_value": { "description": "The payload as UTF-8 text (invalid bytes replaced), at most 65536 characters.", "type": "string", "maxLength": 65536 },
+    "raw_value_bytes": { "description": "Length of the original payload in bytes.", "type": "integer", "minimum": 0 },
+    "raw_value_truncated": { "type": "boolean" },
+    "source": {
+      "description": "Where the rejected record lives in the raw topic, so it can be re-read and replayed after a fix.",
+      "type": "object",
+      "required": ["topic", "partition", "offset", "kafka_timestamp_ms", "headers"],
+      "properties": {
+        "topic": { "type": "string" },
+        "partition": { "type": "integer", "minimum": 0 },
+        "offset": { "type": "integer", "minimum": 0 },
+        "kafka_timestamp_ms": { "type": "integer" },
+        "headers": { "description": "The producer's sp-* headers as text.", "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "job_version": { "type": "string" },
+    "detected_at_ms": { "description": "Processing time of the rejection (not part of any idempotency claim).", "type": "integer" }
+  }
+}

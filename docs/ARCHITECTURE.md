@@ -289,7 +289,7 @@ All names carry the `streampulse_producer_` prefix.
 
 ## 7. Data contracts and schema evolution
 
-📐 Phases 2–3. Decision: [ADR-0005](adr/0005-serialization-and-schema-contracts.md).
+✅ Raw-topic contract implemented in Phase 2. ✅ `EditEvent`, parser and DLQ contract implemented in **Phase 3a** ([`contract/`](../flink-jobs/src/main/java/io/github/arttgrantollii/streampulse/contract/)), with 46 unit and contract tests. Decision: [ADR-0005](adr/0005-serialization-and-schema-contracts.md).
 
 There are three contracts:
 
@@ -317,6 +317,21 @@ EditEvent v1
   sourceSchema     String   $schema
   kafka            topic/partition/offset of the raw record (for DLQ/debug)
 ```
+
+**Implemented as (3a):**
+- `EditEvent`: a Java record with 22 fields.
+  - **FACT:** Flink 2.2 serializes it with its POJO serializer, not Kryo (`EditEventTypeTest`). That matters for evolving state across upgrades.
+  - The serializer round-trip is tested with nulls.
+- `EditEventParser`:
+  - Jackson 2.18.2 tree model with `FAIL_ON_TRAILING_TOKENS`.
+  - Typed accessors: absent or JSON `null` becomes `null`, a wrong type is rejected, and nothing is coerced.
+  - `meta.dt` is parsed as `OffsetDateTime`, so both `Z` and explicit offsets are accepted.
+  - Ingest time comes from `sp-ingest-ts`, falling back to the Kafka record timestamp.
+  - Returns `ParseResult.Valid` or `ParseResult.Invalid(DlqRecord)`. Rejection is an expected outcome, so no stack traces are created.
+- **Event-time sanity bounds, refined from Phase 2 evidence:**
+  - More than **5 min after ingest** → `impossible_time` for **every** type, because a future timestamp would push watermarks ahead.
+  - More than **31 days before ingest** → `impossible_time` for **edits only**, because old timestamps are legitimate on log events (the 2005 Commons upload, Research 0002 §1.5).
+- **Tested on real data:** all 120 fixture events parse; meta.dt ≥ timestamp holds for every one; `new` events have no previous revision.
 
 **Evolution rules:**
 - unknown upstream fields → ignored;
@@ -433,14 +448,14 @@ Both formulas are fixed only after replaying a 24 h recording (EXPERIMENT).
 
 ## 13. Invalid events and the DLQ
 
-📐 Phase 3.
+✅ DLQ record contract and rejection rules implemented in Phase 3a ([`schemas/streampulse/dlq-record.v1.json`](../schemas/streampulse/dlq-record.v1.json); `DlqRecordTest` validates real output against the schema). 📐 The Kafka DLQ sink comes in 3b.
 
 | Category | Example | Route | Metric |
 |---|---|---|---|
 | `invalid_json` | truncated payload | DLQ | `dlq_records_total{reason}` |
 | `missing_identity` | no `meta.id`; EDIT without `wiki`/`title` | DLQ | same |
 | `missing_time` | neither `timestamp` nor `meta.dt` | DLQ | same |
-| `impossible_time` | more than 5 min in the future or 31 d in the past vs ingest | DLQ | same |
+| `impossible_time` | more than 5 min after ingest (any type), or an **edit** more than 31 d before ingest | DLQ | same |
 | `incompatible_type` | `timestamp` as a string | DLQ | same |
 | canary | `meta.domain=canary` | dropped | `canary_events_total` |
 | duplicate | repeated `meta.id` | dropped | `duplicates_dropped_total` |

@@ -199,15 +199,17 @@ services:
     image: maven:3.9.16-eclipse-temurin-17
     profiles: ["build"]
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
-    working_dir: /workspace
+    working_dir: /workspace/flink-jobs
     environment:
       # The host uid has no home directory inside the image; give Maven a writable one.
       # (MAVEN_CONFIG is deliberately not set: the mvn launcher would treat it as CLI args.)
       HOME: /tmp
     # Dependencies are cached in flink-jobs/.m2 (gitignored) so rebuilds are fast.
-    command: ["mvn", "-B", "-ntp", "-Dmaven.repo.local=/workspace/.m2/repository", "verify"]
+    command: ["mvn", "-B", "-ntp", "-Dmaven.repo.local=/workspace/flink-jobs/.m2/repository", "verify"]
     volumes:
-      - ./flink-jobs:/workspace
+      # The whole repository, so tests can read the shared fixtures in sample-data/ and
+      # schemas/; the build only writes inside flink-jobs/ (target/, dist/, .m2/).
+      - .:/workspace
 
 volumes:
   kafka-data:

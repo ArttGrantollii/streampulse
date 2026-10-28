@@ -16,7 +16,7 @@
 3. **Idleness:** `withIdleness(I)` so that a partition with no data doesn't stall progress. It mainly matters for replay and small fixtures, since live traffic keeps all 3 partitions busy.
 4. **Allowed lateness L** on windows: late-but-allowed events update an already-emitted window result. The upsert sink makes the update safe ([ADR-0008](0008-postgres-sink-semantics.md)).
 5. **Beyond L:** side-output to `wikimedia.recentchange.late.v1` and count in a metric. Never drop silently.
-6. **Sanity bounds** (DLQ, not late): event time more than **+5 min** in the future, or more than **31 days** in the past, relative to `sp-ingest-ts`. 31 days is the maximum upstream retention, so nothing older can be legitimately replayed. Both are measured against the *original* ingest time, which replay preserves, so validation is deterministic.
+6. **Sanity bounds** (DLQ, not late): event time more than **+5 min** in the future (**any type**), or more than **31 days** in the past (**edits only**; refined in Phase 3a after a legitimate 2005 timestamp on a log event), relative to `sp-ingest-ts`. 31 days is the maximum upstream retention, so nothing older can be legitimately replayed. Both are measured against the *original* ingest time, which replay preserves, so validation is deterministic.
 
 **Initial parameters (ASSUMPTION until R-2):** B = 10 s (≈ p99 observed), L = 2 min (covers the observed max of 50 s with margin), I = 30 s.
 

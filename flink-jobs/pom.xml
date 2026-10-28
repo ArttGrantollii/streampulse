@@ -24,6 +24,7 @@
         <assertj.version>3.27.3</assertj.version>
         <log4j.version>2.24.3</log4j.version>
         <slf4j.version>1.7.36</slf4j.version>
+        <jackson.version>2.18.2</jackson.version>
     </properties>
 
     <dependencies>
@@ -55,6 +56,14 @@
             <version>${flink.connector.kafka.version}</version>
         </dependency>
 
+        <!-- JSON parsing of upstream payloads. Same version the Kafka connector already brings,
+             so the job jar carries a single copy. (Flink's own shaded Jackson is internal API.) -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+
         <!-- Tests: operator test harnesses live in Flink's test jars. -->
         <dependency>
             <groupId>org.apache.flink</groupId>
@@ -80,6 +89,17 @@
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
             <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- Contract test: DLQ records must validate against schemas/streampulse/dlq-record.v1.json.
+             1.5.9 (Jackson 2) rather than the maintained 3.x: 3.x needs a newer
+             com.fasterxml.jackson.annotation than the job's Jackson 2.18.2 provides (Jackson 3
+             still shares that package), and production dependencies must not bend to a test tool.
+             Test scope only: never part of the job jar. -->
+        <dependency>
+            <groupId>com.networknt</groupId>
+            <artifactId>json-schema-validator</artifactId>
+            <version>1.5.9</version>
             <scope>test</scope>
         </dependency>
         <dependency>

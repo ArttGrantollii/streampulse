@@ -24,6 +24,8 @@ Difficulty: **Fundamental** (do you understand the concept?) · **Intermediate**
   - [Producer design](#producer-design)
   - [Source behaviour](#source-behaviour)
   - [Engineering practice](#engineering-practice)
+- [Phase 3 — Correct stream processing](#phase-3--correct-stream-processing)
+  - [3a: Contract and validation](#3a-contract-and-validation)
 - [Senior-level system design scenarios](#senior-level-system-design-scenarios)
 
 ---
@@ -748,6 +750,66 @@ What would you add for a production service?
 
 **Follow-up answer:**
 Automated dependency update PRs (Renovate or Dependabot) that respect the quarantine, vulnerability scanning of the lock and image (e.g. `pip-audit`, Trivy) in CI, hash-pinned base images, and an SBOM per release.
+
+---
+
+## Phase 3 — Correct stream processing
+
+### 3a: Contract and validation
+
+**Question:** How does StreamPulse decide whether an incoming event is invalid, and what happens to invalid events?
+
+**Difficulty:** Intermediate
+
+**Interview-ready answer:**
+One parser, `EditEventParser`, is the only code that reads upstream JSON. It's a tolerant reader:
+- **ignored:** unknown fields, which Wikimedia already sends beyond its own schema;
+- **allowed:** missing optional fields, which become null;
+- **rejected:** only five categories, each with its own reason code: invalid JSON, missing identity (`meta.id`, or wiki/title on an edit), missing time, impossible time, and a wrong JSON type on a field we use.
+
+Rejected records aren't dropped. They become DLQ records carrying the reason, a human-readable detail, the raw payload, and the exact topic, partition and offset, so a record can be found again and replayed after a fix. The DLQ record format has its own versioned JSON Schema and a contract test.
+
+**Deep technical explanation:**
+- **Never coerce:** `"timestamp": "1793188797"` or `"bot": "false"` is rejected, not converted. Coercion hides upstream changes until they've corrupted analytics; a DLQ spike makes them visible.
+- **Time bounds are asymmetric, based on evidence:**
+  - a future time more than 5 minutes past ingest is rejected for *every* type, because one future timestamp would push the watermark ahead;
+  - a time older than 31 days is rejected only for *edits*, because log events legitimately carry old timestamps (we saw a 2005 Commons upload).
+- **Determinism:** bounds are relative to the producer's ingest time, which replay preserves, so a replay classifies every record the same way.
+- **No stack traces:** rejections are created without them, since they're expected outcomes, not errors.
+
+**How StreamPulse demonstrates this:**
+[`EditEventParser.java`](../flink-jobs/src/main/java/io/github/arttgrantollii/streampulse/contract/EditEventParser.java), [`dlq-record.v1.json`](../schemas/streampulse/dlq-record.v1.json), `EditEventParserTest` (36 tests) and `DlqRecordTest`, which validates real output against the schema and checks that the schema rejects an invalid record.
+
+**Potential follow-up question:**
+Wikimedia renames a field you depend on. What happens?
+
+**Follow-up answer:**
+If it's required (`meta.id` or the time fields), every record goes to the DLQ with a precise reason, and the DLQ-rate metric (Phase 5) would alert within minutes. Nothing silently becomes zero. If it's optional, like `bot`, the field becomes null, so I'd also monitor null rates for key fields. Recovery: fix the parser, deploy, then replay the affected range from the raw topic, which keeps 7 days. The DLQ records point to exact offsets.
+
+---
+
+**Question:** Why do you test that Flink serializes `EditEvent` as a POJO?
+
+**Difficulty:** Advanced
+
+**Interview-ready answer:**
+Because Flink fails silently here. If it can't analyse a type (no public no-argument constructor, an unsupported field type), it falls back to Kryo without an error. Kryo is slower, and state written with Kryo can't evolve: adding a field to the class later can make old checkpoints and savepoints unreadable. `EditEvent` will live in dedup and window state, so a test asserts that `TypeInformation.of(EditEvent.class)` is a `PojoTypeInfo` and that the serializer round-trips every field, including nulls. It also confirmed something I'd only assumed: Flink 2.2 treats Java records as POJOs.
+
+**Deep technical explanation:**
+POJO serializers support schema evolution, with fields added or removed through serializer snapshots, so state stays readable across upgrades. You can also make the job fail fast on accidental Kryo use with `pipeline.generic-types: false`, which turns the silent fallback into an error at job start. That's a candidate setting for 3b, once the full job graph exists.
+
+**How StreamPulse demonstrates this:**
+[`EditEventTypeTest`](../flink-jobs/src/test/java/io/github/arttgrantollii/streampulse/contract/EditEventTypeTest.java).
+
+**Potential follow-up question:**
+What else can break restoring state after a code change?
+
+**Follow-up answer:**
+- **Changed operator UIDs:** state is mapped to operators by uid, which is why every stateful operator sets an explicit one.
+- **Incompatible serializer changes:** for example, changing a field's type.
+- **Changed key types or `maxParallelism`:** key groups would no longer line up.
+
+The defence is a savepoint-restore test in CI before deploying, which is planned for Phase 5.
 
 ---
 

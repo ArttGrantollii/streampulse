@@ -289,3 +289,37 @@ Phase 2: the Python producer that makes Wikimedia's live stream durable in Kafka
 5. Measure where the mechanism operates: watermarks are per partition, and analytics are about edits.
 6. "Works on my machine" includes timing. A cold CI runner found a race a warm laptop never hit, and making failures visible (annotations) was the fastest way to find it.
 7. Documented limits aren't typical behaviour. "At most 15 minutes" turned out to be "every few minutes" in practice, so measure the distribution.
+
+---
+
+## Phase 3a — Event contract, parser and DLQ record
+
+**Date:** 2026-10-28 · *Subphase entry (short form); the full Phase 3 entry comes at 3f.*
+
+### What we built
+- **`EditEvent`:** a Java record and the internal contract v1, with 22 fields, nullable where upstream is optional.
+- **`EditEventParser`:** the single place that reads upstream JSON. It returns a valid event or a `DlqRecord` with reason, detail, the raw payload (capped at 64 K characters) and full source coordinates.
+- **`schemas/streampulse/dlq-record.v1.json`**, the published contract for DLQ records, plus the vendored upstream schema `schemas/wikimedia/recentchange-1.0.1.yaml`.
+- **46 tests:**
+  - every rejection reason, including 9 wrong-type cases;
+  - the real edge cases (the 2005 log timestamp, unknown fields, JSON `null`, `+02:00` offsets, non-UTF-8 bytes);
+  - all 120 fixture events;
+  - the schema contract;
+  - the Flink serializer.
+
+### Concepts learned
+- **Tolerant reader, strict where it matters:** ignore unknown fields, accept missing optional ones, and reject only when identity or time is unusable, or a field we rely on has the wrong type. Never coerce, because `"false"` isn't `false`.
+- **Type safety for state:** Flink silently falls back to Kryo for types it can't analyse, and Kryo state can't evolve. A test now asserts `EditEvent` is a POJO type. **FACT:** Flink 2.2 handles Java records as POJOs.
+- **Validation rules come from data, not intuition:** the "older than 31 days" rule applies to edits only, because real log events carry 2005 timestamps. The "future" rule applies to everything, because one future timestamp would distort watermarks.
+- **Contract tests need a negative case:** the schema test also asserts that an invalid record is *rejected*. Otherwise a misconfigured validator would pass everything.
+
+### Problems encountered and solutions
+1. **The maintained JSON Schema validator (3.0.8) failed with `NoClassDefFoundError: com/fasterxml/jackson/annotation/JsonSerializeAs`.** I had assumed Jackson 3 lives entirely in a new namespace (`tools.jackson`) and couldn't clash with the job's Jackson 2. **That was wrong:** Jackson 3 still uses the `com.fasterxml.jackson.annotation` package, and needs a newer version of it than 2.18.2. *Solution:* the frozen 1.5.9 line (Jackson 2), test scope only. Upgrading production Jackson to suit a test tool was rejected.
+2. **Fixtures outside the Maven module:** the build container only mounted `flink-jobs/`, so tests couldn't read `sample-data/`. *Solution:* mount the repository root and run Maven in `flink-jobs/`; the build still writes only inside `flink-jobs/`.
+
+### How we verified
+- `docker compose --profile build run --rm flink-jobs-build`: **48 tests, 0 failures** (46 new, plus the 2 smoke tests).
+- The shaded jar contains no test libraries (0 networknt classes) and exactly one `jackson-databind` (2.18.2).
+
+### Key takeaway
+Before relying on "these can't conflict", check what is actually shared. Namespaces and artifacts aren't the same thing.

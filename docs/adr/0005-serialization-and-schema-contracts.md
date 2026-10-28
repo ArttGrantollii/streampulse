@@ -24,8 +24,11 @@
    - missing `meta.id`
    - missing both `timestamp` and `meta.dt`
    - missing `wiki` or `title` on an edit
-   - a timestamp outside sanity bounds relative to ingest time
-4. **Records we publish (DLQ, late)** have versioned JSON Schemas in `schemas/streampulse/`. Each record carries `schema_version`. Changes within a major version are additive only; a breaking change creates a new topic `.v2`.
+   - a timestamp outside sanity bounds relative to ingest time: more than 5 min in the future for any type, or more than 31 days old for an edit (refined in Phase 3a from Research 0002 §1.5, where a legitimate 2005 timestamp appeared on a log event)
+   - a field we use with the wrong JSON type (`incompatible_type`); values are never coerced
+
+   *Implemented in Phase 3a (`EditEventParser`, 36 tests, including every rejection reason and the real edge cases).*
+4. **Records we publish (DLQ, late)** have versioned JSON Schemas in `schemas/streampulse/`. A contract test validates the job's real DLQ output against `dlq-record.v1.json`, and checks that the schema rejects an invalid record, so the test can't pass vacuously. Each record carries `schema_version`. Changes within a major version are additive only; a breaking change creates a new topic `.v2`.
 5. **No Schema Registry and no Avro/Protobuf in V1.**
 
 ## Alternatives
