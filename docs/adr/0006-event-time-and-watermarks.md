@@ -20,6 +20,11 @@
 
 **Initial parameters (ASSUMPTION until R-2):** B = 10 s (≈ p99 observed), L = 2 min (covers the observed max of 50 s with margin), I = 30 s.
 
+**Early evidence (2026-10-28, PRELIMINARY):**
+- Disorder per Kafka partition for **edits only** reached p99 25 s, p99.9 108 s and max 195 s in a 10-minute sample ([Research 0002 §1.7](../research/0002-ingestion-behaviour.md)), so B = 10 s is likely too small.
+- A legitimate Commons log event carried a 2005 timestamp (§1.5), so sanity bounds must not treat all old timestamps as invalid.
+- Parameters will be set from the 24-hour run.
+
 **Selection rule once data exists:** B ≈ p99 and L ≈ p99.99 of measured disorder. Results are emitted early, and the tail corrects them.
 
 ## Alternatives

@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only access is all this workflow needs.
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  producer:
+    name: Producer (lint + unit tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: producer
+    steps:
+      - uses: actions/checkout@v7
+
+      # setup-uv publishes only full version tags (no moving "v10" tag).
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+          working-directory: producer
+
+      # --locked fails if uv.lock is out of date with pyproject.toml.
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest -m "not integration" -v
+
+  producer-integration:
+    name: Producer (integration, real Kafka)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+          working-directory: producer
+
+      # The same pinned broker and topic setup as local development, not a look-alike.
+      - name: Start Kafka from docker-compose.yml
+        run: |
+          cp .env.example .env
+          docker compose up -d kafka kafka-init
+          docker compose wait kafka-init
+
+      - run: uv sync --locked
+        working-directory: producer
+      - run: uv run pytest -m integration -v
+        working-directory: producer
+
+      - name: Kafka logs on failure
+        if: failure()
+        run: docker compose logs kafka kafka-init
+
+  flink-jobs:
+    name: Flink jobs (build + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - run: mvn -B -ntp verify
+        working-directory: flink-jobs
+
+  compose:
+    name: Compose file and scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - run: cp .env.example .env && docker compose --profile live --profile build config -q
+
+      # Every shell script must parse; shellcheck catches the classic bash traps.
+      - run: shellcheck scripts/*.sh infra/*/*.sh

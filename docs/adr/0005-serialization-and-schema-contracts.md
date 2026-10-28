@@ -14,9 +14,10 @@
    - `sp-sse-id`: the upstream SSE id JSON, used for resume
    - `sp-producer`: producer name and version
    - `sp-mode`: `live` or `replay`
+   - `sp-connection`: which upstream connection delivered it (`live-<session>-<n>` or `replay`), so duplicates can be attributed to reconnects or restarts
    - `sp-replayed-at`: replay only
 
-   The Kafka record timestamp (`CreateTime`) is the ingest time.
+   The Kafka record timestamp (`CreateTime`) is the ingest time in live mode. **In replay mode it's the replay time:** Kafka retention deletes by record timestamp, so a recording's old timestamps would expire immediately. The original ingest time survives in `sp-ingest-ts`. (Implemented in Phase 2.)
 2. **The Wikimedia schema is vendored** under `schemas/wikimedia/` (pinned 1.0.1) and used in tests and fixtures, not at runtime.
 3. **The internal contract is a typed Java record `EditEvent` (v1),** produced by one parser with an explicit validation step. The parser **ignores unknown fields** and **tolerates missing optional ones**. It rejects a record only when *identity or time* is unusable:
    - invalid JSON

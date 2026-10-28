@@ -187,3 +187,95 @@ Phase 1: the local platform. Kafka, Flink and PostgreSQL start with one command,
 3. A test that passes can still be wrong. Check *what* it verified, not just that it said PASS. Run from a clean room, because state left over from earlier runs hides bugs.
 4. Prefer explicit readiness rules over tools whose semantics don't fit (`--wait` with init containers).
 5. Idempotency and durability are claims, and both were tested: re-run everything, destroy the containers, check again.
+
+---
+
+## Phase 2 — Ingestion
+
+**Date:** 2026-10-28
+
+### Milestone
+Phase 2: the Python producer that makes Wikimedia's live stream durable in Kafka, plus record and replay modes, CI, and the start of the 24-hour source measurement. The 24-hour results are added to Research 0002 when the run completes.
+
+### What we built
+- **`producer/`**, a Python 3.14 package (uv-locked) with one module per responsibility:
+  - the SSE parser;
+  - the live source (reconnect, backoff, resume, `since` guard);
+  - the replay source (speed, rate or unpaced);
+  - the Kafka publisher (key, headers, delivery tracking, backpressure);
+  - resume from Kafka;
+  - an SNTP clock-offset probe;
+  - Prometheus metrics and structured JSON logs.
+- **A Docker image and an opt-in Compose service** (`make ingest`), with health check and graceful stop.
+- **64 tests:**
+  - 55 unit tests, including a scripted fake upstream for reconnects, HTTP errors and resume;
+  - 9 integration tests against the real broker: byte-for-byte replay, Java-compatible partitioning, and resume from real records.
+- **GitHub Actions CI:**
+  - producer lint and unit tests;
+  - producer integration tests against the Compose Kafka;
+  - Flink build and tests;
+  - Compose validation and ShellCheck.
+- **`scripts/research/analyze_raw_topic.py`**, which measures R-1 to R-6 straight from the raw topic.
+- **A committed 120-event fixture** with attribution.
+
+### Concepts learned
+- **At-least-once by construction:**
+  - Resume positions are timestamps, so a resume re-delivers events that share the boundary millisecond.
+  - The restart margin deliberately re-reads 30 s.
+  - Duplicates are the price of never having a gap, and dedup downstream is the plan.
+- **Idempotent producer scope:** it removes retry duplicates *within one producer session*, not duplicates that come from re-reading the source.
+- **Backpressure in a producer:** a full local queue blocks `produce()`, which stops reading upstream, instead of dropping data.
+- **Graceful shutdown:** SIGTERM sets a flag, the loop stops, in-flight messages are flushed, and the exit code says whether delivery succeeded.
+- **Partitioner compatibility across clients:** librdkafka uses CRC32 by default and Java uses murmur2. Same key, different partition, unless configured.
+- **Disorder must be measured where watermarks are generated** (per Kafka partition) and for the events that matter (edits).
+- **Steady state vs catch-up:** after a restart, event age is backlog, not latency. The analysis separates them.
+
+### Why we did it this way
+- **Kafka as the producer's checkpoint:** the position can't disagree with what was actually written.
+- **Our own SSE parser:** small, spec-conformant, and fully testable. We need exact `id` semantics for resume.
+- **Integration tests against the real Compose broker instead of Testcontainers:** one fewer framework, and the real pinned configuration.
+- **Live ingestion is opt-in:** `make up` shouldn't contact a third party or fill the disk without being asked.
+
+### Problems encountered
+1. **Restart resumed 8 days in the past.** The first restart test ingested about 85,000 events from 8 days earlier in under a minute. `since` was sent as epoch milliseconds, and Wikimedia silently ignored it and started from its oldest retained event. My unit test had asserted the epoch format, so it encoded the bug rather than catching it.
+2. **A shell pipeline swallowed the evidence.** The first restart attempt, piped through a log formatter, printed nothing and reported exit 143. The run had actually happened and written 66,731 records.
+3. **The integration test compared the wrong records.** It matched records by receive millisecond, but 8 fixture events share a millisecond, and 3 even share an SSE id.
+4. **An arg-parsing hack:** I first detected `--rate` by searching `sys.argv`, because `--rate max` and no rate both became `None`.
+5. **ShellCheck SC2145:** `"/opt/kafka/bin/"$@"` in the smoke test only worked by accident.
+6. **A diagnostic that could only ever say 0:** "duplicates within a run" was computed from a dict, whose keys are unique by construction. I discarded that number rather than reporting it.
+7. **Analysis skewed by a catch-up.** Receive − `meta.dt` came out at a median of 238 s because a restart's backlog was included.
+8. **The scratchpad recording from Phase 0 was gone after a reboot,** so the fixture had to be re-captured.
+
+### How we solved them
+1. Probed Wikimedia directly. ISO was honoured to within 0.0 s; epoch ms was off by −712,330 s, the start of retention. Fixed the format, added a check that the first event matches the requested `since` (else exit 1) and a 24 h maximum resume age (else exit 2), replaced the wrong test, and truncated the polluted records with `kafka-delete-records` before the 24-hour run. Documented as an incident in ADR-0012.
+2. Re-ran with output written to a file, then grouped the raw topic by `sp-connection` to reconstruct what each run had done. That's the header earning its keep.
+3. Matched on payloads, which are unique. The finding (SSE ids aren't unique) went into Research 0002 §1.3.
+4. Kept the raw `--rate` string and interpreted it explicitly (`_replay_pacing`).
+5. Rewrote it as `kafka <tool> [args]`, and ShellCheck now runs in CI.
+6. Recorded the defect; within-connection duplicates are measured by the analysis tool instead.
+7. The tool now treats each connection as catching up until its events are fresh (< 10 s), and measures steady-state delay after that: p50 256 ms, p99 5.4 s.
+8. Captured 20 s of fresh data with the committed research script. The fixture is now committed, so it can't be lost again.
+
+### How we verified the work
+- `uv run pytest`: **64 passed** (55 unit, 9 integration against Kafka 4.2.2). `ruff check` and `ruff format --check` are clean. ShellCheck is clean.
+- **Live, against Wikimedia:**
+  - SIGTERM after 40 s: exit 0, all 1,598 events in Kafka.
+  - Restart: resumed from an ISO position, overlap exactly 30.0 s, 949 duplicates, no gap.
+  - Container `docker stop`: exit 0 in 0.5 s.
+  - Container start after 8.5 min of downtime: caught up about 14,000 events within seconds.
+- **Partitioning:** every replayed record sits on the partition Java's murmur2 would choose, and our murmur2 matches Kafka 4.2.2's six reference values.
+- **Dependency cutoff:** `exclude-newer` resolved ruff 0.17.0, not the newer 0.17.1, and confluent-kafka 2.16.0, not the newer 2.16.1.
+- The smoke test still passes with live ingestion running alongside.
+
+### Production perspective
+- WMF-internal consumers read Kafka directly, so the SSE layer and its 15-minute reconnects wouldn't exist.
+- A single active producer would need leader election, or the redundancy of two producers plus dedup.
+- Alerts would fire on `reconnects{cause!="server_closed"}`, on `produce_errors`, on a growing `last_event_emitted` age, and on clock offset.
+- Secrets aren't needed for a public SSE source, but a production client would identify itself through a registered User-Agent, and possibly an API key.
+
+### Key takeaways
+1. A request that "succeeds" isn't proof of the effect. Verify outcomes at boundaries you don't control, and cap the blast radius.
+2. A test that asserts what your code does, rather than what the other side requires, can encode the bug.
+3. Make the system of record cleanable, and clean it before measuring.
+4. Every header you add for observability (here `sp-connection`) pays off the first time something goes wrong.
+5. Measure where the mechanism operates: watermarks are per partition, and analytics are about edits.

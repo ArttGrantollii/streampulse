@@ -1,0 +1,53 @@
+[project]
+name = "streampulse-producer"
+version = "0.1.0"
+description = "Ingests Wikimedia EventStreams (live) or recordings (replay) into Kafka for StreamPulse."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.14"
+dependencies = [
+    "confluent-kafka>=2.16.0,<3",
+    "httpx>=0.28.1,<0.29",
+    "prometheus-client>=0.26.0,<0.27",
+    "structlog>=26.1.0,<27",
+]
+
+[project.scripts]
+streampulse-producer = "streampulse_producer.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1,<10",
+    "ruff>=0.17,<0.18",
+]
+
+[build-system]
+requires = ["uv_build>=0.12,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv]
+# Two-week rule for the whole dependency tree, transitive packages included:
+# the resolver ignores anything published after this date (docs/COMPATIBILITY.md).
+exclude-newer = "2026-10-14T00:00:00Z"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 110
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes: unused imports, undefined names
+    "I",   # import sorting
+    "UP",  # pyupgrade: modern Python syntax
+    "B",   # flake8-bugbear: common bug patterns
+    "SIM", # flake8-simplify
+    "RUF", # Ruff-specific rules
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers", "--strict-config"]
+markers = [
+    "integration: needs a real Kafka broker (STREAMPULSE_TEST_KAFKA, default localhost:9094)",
+]

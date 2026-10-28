@@ -19,5 +19,5 @@ Each ADR records one significant decision: its context, the alternatives conside
 | [0009](0009-state-backend-and-checkpoint-storage.md) | RocksDB + incremental checkpoints on a shared Docker volume, no MinIO | Accepted | Phase 1 and 5 |
 | [0010](0010-spike-detection.md) | Poisson tail test against an EWMA baseline with a minimum volume | Proposed | Phase 4 |
 | [0011](0011-postgresql-over-clickhouse.md) | PostgreSQL, not ClickHouse, for V1 serving | Accepted | Phase 3 |
-| [0012](0012-producer-resume-from-kafka.md) | Producer resumes from the SSE id stored in Kafka record headers | Proposed (validate R-1) | Phase 2 |
+| [0012](0012-producer-resume-from-kafka.md) | Producer resumes from the SSE id stored in Kafka record headers (ISO `since` + guards) | Accepted | Phase 2 ✅ |
 | [0013](0013-public-showcase.md) | Public showcase is a static site (live in-browser view + recorded results), not a hosted pipeline | Accepted | Phase 6 |

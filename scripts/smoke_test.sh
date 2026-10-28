@@ -22,7 +22,8 @@ TIMEOUT_S="${SMOKE_TIMEOUT_S:-120}"
 
 cd "$(dirname "$0")/.."
 compose() { docker compose "$@"; }
-kafka() { compose exec -T kafka /opt/kafka/bin/"$@" --bootstrap-server kafka:9092; }
+# kafka <tool> [args...]: run a Kafka CLI tool against the broker.
+kafka() { local tool="$1"; shift; compose exec -T kafka "/opt/kafka/bin/$tool" "$@" --bootstrap-server kafka:9092; }
 jm() { compose exec -T flink-jobmanager "$@"; }
 # The flink CLI inherits JVM flags from the image that export jdk.compiler, a module
 # the image's JRE does not ship; drop only that harmless warning, keep all other stderr.

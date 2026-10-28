@@ -34,7 +34,7 @@ The first draft had 12 phases. It was cut to **6** to make sure the project ship
 - **Learned:** KRaft, listeners, topic configuration, Flink session clusters and slots, health checks, named volumes, and Flyway migrations.
 - **Acceptance:** see [§ Phase 1 acceptance criteria](#phase-1-acceptance-criteria). All 10 were met on 2026-10-27, except that `make` itself awaits installation on the dev machine (the Makefile targets wrap commands that were each run and verified directly).
 
-## Phase 2 — Ingestion 🔜
+## Phase 2 — Ingestion ✅ (24-hour measurement running)
 - **Goal:** a Python producer with `live`, `replay` and `record` modes sharing one publishing path.
   - Live mode: SSE parsing, reconnects with jittered backoff, and resume ([ADR-0012](adr/0012-producer-resume-from-kafka.md)).
   - Kafka producer settings: idempotence, `acks=all`, zstd, and the murmur2 partitioner.
@@ -44,9 +44,17 @@ The first draft had 12 phases. It was cut to **6** to make sure the project ship
 - **Learned:** partitions, keys, ordering, acknowledgements, idempotence scope, backoff and graceful shutdown.
 - **Acceptance:**
   - unit tests for the SSE parser and key extraction;
-  - a Testcontainers Kafka integration test for replay;
+  - an integration test for replay against a real broker;
   - a forced disconnect resumes without gaps;
   - `docs/research/0002-*` is published.
+- **Status (2026-10-28):**
+  - ✅ 55 unit tests and 9 integration tests;
+  - ✅ restart resume measured (overlap = margin, no gap);
+  - ✅ graceful `docker stop`;
+  - ✅ CI workflow;
+  - ✅ Research 0002 published with initial findings.
+  - ⏳ The 24-hour section of Research 0002 is due after 2026-10-29 13:10 UTC.
+- **Change from plan: no Testcontainers.** Integration tests run against the *same* pinned broker and topic setup as development (`docker compose up kafka kafka-init`, locally and in CI). That's one fewer framework, and it tests the real configuration rather than a look-alike.
 
 ## Phase 3 — Correct stream processing ⏳
 - **Goal:** the Java Flink job.

@@ -164,6 +164,35 @@ services:
       start_period: 20s
     mem_limit: 2560m
 
+  # Live ingestion from Wikimedia. Opt-in (`make ingest`), so `make up` alone never
+  # contacts Wikimedia or grows the raw topic (~0.8 GB/day). See producer/README.md.
+  producer:
+    build: ./producer
+    image: streampulse-producer:0.1.0
+    profiles: ["live"]
+    command: ["--mode", "live"]
+    environment:
+      STREAMPULSE_KAFKA_BOOTSTRAP: kafka:9092
+      STREAMPULSE_TOPIC: wikimedia.recentchange.raw.v1
+      STREAMPULSE_METRICS_PORT: "8000"
+      STREAMPULSE_LOG_LEVEL: ${PRODUCER_LOG_LEVEL:-INFO}
+    ports:
+      - "127.0.0.1:${PRODUCER_METRICS_HOST_PORT:-8000}:8000"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      # The slim image has no curl; Python is there anyway.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+    # SIGTERM -> stop reading -> flush in-flight messages (up to 30 s) -> exit 0.
+    stop_grace_period: 45s
+    mem_limit: 256m
+    restart: unless-stopped
+
   # Build tool, not a service: `docker compose --profile build run --rm flink-jobs-build`.
   # Builds and tests the Java jobs without needing a JDK or Maven on the host.
   flink-jobs-build:

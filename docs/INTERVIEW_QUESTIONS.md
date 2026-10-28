@@ -20,6 +20,10 @@ Difficulty: **Fundamental** (do you understand the concept?) · **Intermediate**
   - [Kafka in KRaft mode](#kafka-in-kraft-mode)
   - [Flink, Kafka offsets and checkpoints](#flink-kafka-offsets-and-checkpoints)
   - [Platform engineering](#platform-engineering)
+- [Phase 2 — Ingestion](#phase-2--ingestion)
+  - [Producer design](#producer-design)
+  - [Source behaviour](#source-behaviour)
+  - [Engineering practice](#engineering-practice)
 - [Senior-level system design scenarios](#senior-level-system-design-scenarios)
 
 ---
@@ -571,6 +575,152 @@ What would break if you shaded Flink itself into the jar?
 
 **Follow-up answer:**
 You'd have two copies of Flink classes in different classloaders. Flink loads user code child-first, so types like `StreamExecutionEnvironment` or state descriptors from your jar wouldn't match the runtime's. That causes `ClassCastException` or `LinkageError` problems that are hard to diagnose. Provided scope keeps one copy, owned by the runtime.
+
+---
+
+## Phase 2 — Ingestion
+
+### Producer design
+
+**Question:** How does the StreamPulse producer make sure it never silently loses events between Wikimedia and Kafka?
+
+**Difficulty:** Intermediate / Advanced
+
+**Interview-ready answer:**
+Three mechanisms, one per failure point:
+- **Acknowledged writes:** `acks=all` with an idempotent producer. A record counts only once Kafka confirms it, and any delivery failure makes the producer stop instead of moving on.
+- **Reconnects:** before resuming with `Last-Event-ID`, I flush, so the id I resume from refers to an event Kafka has acknowledged.
+- **Restarts:** the producer reads the last record of every partition back from Kafka, takes the *oldest* position, and resumes 30 seconds before it.
+
+The trade-off is deliberate: I accept duplicates, which Flink dedup removes, in exchange for never having a gap. A restart test measured an overlap of exactly the 30-second margin, with no gap.
+
+**Deep technical explanation:**
+- **Why the oldest partition:** the idempotent producer only orders writes *per partition*. After a crash, one partition can hold acknowledged records newer than records still in flight to another, so resuming from the newest position could skip those.
+- **Why Kafka itself is the checkpoint:** every record carries its upstream SSE id in a header, so the log can't disagree with a separate state file about what was actually written.
+- **Backpressure:** if librdkafka's local queue is full, `produce()` raises `BufferError`. I block and poll instead of dropping, which stops reading upstream: backpressure all the way to the source.
+
+**How StreamPulse demonstrates this:**
+[`publisher.py`](../producer/src/streampulse_producer/publisher.py), [`live.py`](../producer/src/streampulse_producer/live.py), [`resume.py`](../producer/src/streampulse_producer/resume.py), [ADR-0012](adr/0012-producer-resume-from-kafka.md). Measurements are in [Research 0002 §1.4](research/0002-ingestion-behaviour.md).
+
+**Potential follow-up question:**
+So is Wikimedia → Kafka exactly-once?
+
+**Follow-up answer:**
+No, it's at-least-once, and only while downtime is shorter than Wikimedia's retention of 7 to 31 days. Idempotence removes duplicates from *retries within one producer session*. It can't remove duplicates from re-reading the source after a reconnect or restart, and neither can Kafka transactions, because the duplicate comes from upstream, not from the write path. That's why dedup by `meta.id` belongs downstream, in Flink.
+
+---
+
+**Question:** Tell me about a bug you found in StreamPulse that tests didn't catch.
+
+**Difficulty:** Senior
+
+**Interview-ready answer:**
+Restart resume. My unit tests passed: the producer computed the right position and sent it as `since=<epoch milliseconds>`. When I restarted it for real, it ingested about 85,000 events in under a minute, all from **8 days earlier**. Wikimedia's `since` parameter is parsed with JavaScript's `Date.parse`. An epoch-ms string isn't valid input, and instead of returning an error, the server silently starts from its oldest retained event. I confirmed it with a direct probe: ISO-8601 was honoured to within 0.0 seconds, and epoch ms was off by −712,330 seconds. I fixed the format, but I also added two guards, because the real problem was trusting the request rather than verifying its effect:
+- the first event must be near the requested time, or the producer stops;
+- a resume more than 24 hours back is refused unless explicitly allowed.
+
+**Deep technical explanation:**
+My test was wrong too: it asserted the epoch value I sent, which encoded my assumption instead of the server's contract. I replaced it with one that asserts the ISO format, and added tests for both guards. The cleanup mattered as well. The raw topic is the system of record, so I truncated the polluted records with `kafka-delete-records` before starting the 24-hour measurement. Otherwise the event-time statistics, and later every Flink test, would have been contaminated.
+
+**How StreamPulse demonstrates this:**
+The incident section of [ADR-0012](adr/0012-producer-resume-from-kafka.md), [Research 0002 §1.1](research/0002-ingestion-behaviour.md), and `since_param` / `_check_resumed_at` in [`live.py`](../producer/src/streampulse_producer/live.py).
+
+**Potential follow-up question:**
+How do you protect against this class of problem in general?
+
+**Follow-up answer:**
+Verify outcomes at boundaries you don't control: check the response matches the request. Put hard limits on blast radius, like a maximum catch-up age or rate limits. Make the system of record cleanable. And test against the real dependency where it's cheap: a 25-second restart against the live service found what dozens of mocked tests couldn't.
+
+---
+
+**Question:** Why does your Python producer set `partitioner=murmur2_random`, and how did you verify it?
+
+**Difficulty:** Intermediate / Advanced
+
+**Interview-ready answer:**
+librdkafka's default partitioner hashes keys with CRC32, while the Java client uses murmur2. If both a Python and a Java producer wrote the same key to the same topic, they'd put it on different partitions, which silently breaks per-key ordering. `murmur2_random` makes librdkafka hash like Java. I didn't trust the config name: my integration test implements Kafka's Java murmur2, checks it against all six reference values in Kafka 4.2.2's own unit tests, then asserts that every record the producer wrote landed on the partition Java would have chosen.
+
+**Deep technical explanation:**
+Java's default partition is `toPositive(murmur2(keyBytes)) % numPartitions`, where `toPositive` masks the sign bit. The `_random` suffix only affects null keys, which are spread randomly; Java's sticky partitioner behaves differently there, but null keys have no ordering to preserve. The bigger lesson is client heterogeneity: defaults differ across Kafka clients (`enable.idempotence` is false in librdkafka but true in Java since 3.0), so settings must be explicit.
+
+**How StreamPulse demonstrates this:**
+`test_replay_lands_every_record_byte_for_byte_on_the_java_partition` and `test_java_murmur2_matches_kafkas_reference_values` in [`test_integration_kafka.py`](../producer/tests/test_integration_kafka.py).
+
+**Potential follow-up question:**
+What happens to key placement if you later add partitions?
+
+**Follow-up answer:**
+`hash % n` changes for most keys, so new records for a key can go to a different partition than its old ones, and per-key ordering across the change is lost. That's why `create-topics.sh` refuses to "fix" a partition-count mismatch automatically, and why I picked the count upfront.
+
+---
+
+### Source behaviour
+
+**Question:** Wikimedia closes your connection every 15 minutes. How do you handle that, and what does it cost?
+
+**Difficulty:** Intermediate
+
+**Interview-ready answer:**
+It's treated as routine, not as an error. If a connection lived at least 60 seconds and delivered events, the producer resets its backoff and reconnects immediately, sending `Last-Event-ID`. Only quick, repeated failures back off exponentially with full jitter, up to 60 seconds, and an HTTP `Retry-After` is honoured. The cost is small duplicate overlaps. The SSE id holds a millisecond *timestamp*, not an offset, and I found three cases in 120 events where several events share one id. Resuming re-delivers the events in that millisecond.
+
+**Deep technical explanation:**
+Full jitter, a uniform random wait between 0 and the exponential ceiling, prevents synchronised retry storms when many clients fail together. Every reconnect is counted by cause (`server_closed`, `timeout`, `network_error`, `http_<status>`), and records carry `sp-connection`, so the 24-hour analysis can attribute each duplicate to a reconnect or a restart.
+
+**How StreamPulse demonstrates this:**
+[`live.py`](../producer/src/streampulse_producer/live.py), [`backoff.py`](../producer/src/streampulse_producer/backoff.py), and `test_long_healthy_connection_resets_backoff` / `test_http_errors_back_off_and_are_counted_by_status` in the tests. The 24-hour duplicate counts are in Research 0002 §2 (pending).
+
+**Potential follow-up question:**
+Why not run two producers in parallel for redundancy?
+
+**Follow-up answer:**
+Each would write the full stream, doubling every record. It would work, since dedup by `meta.id` removes the copies, but it doubles Kafka volume and dedup state to protect against something resume already handles. Production systems use active-passive with leader election instead. I'd only consider active-active if the requirement was zero ingestion gap even during a producer restart.
+
+---
+
+**Question:** What did measuring the real stream change about your event-time design?
+
+**Difficulty:** Advanced
+
+**Interview-ready answer:**
+Three things, even before the 24-hour run finished:
+- **Edits are more out of order than events overall.** In a 10-minute sample, edits were p99 25 s behind the newest edit in their partition, against p99 13 s for all events. My initial 10-second watermark bound was too small.
+- **Some legitimate events have ancient timestamps.** A Commons upload log event emitted today carried a 2005 timestamp, so "older than 31 days means invalid" would have sent valid data to the DLQ. Time sanity bounds belong on the events that analytics use.
+- **The dangerous case is the opposite: future timestamps.** An old event can't move a max-based watermark, but one future timestamp would push it ahead and make every normal event late. The analysis now counts both cases by event type.
+
+**Deep technical explanation:**
+Disorder must be measured *per Kafka partition*, because Flink generates watermarks per partition and takes the minimum. Measuring disorder over the whole stream would describe the wrong thing. I also separate steady-state delay from catch-up: after a restart the producer replays its backlog, and those old events say nothing about pipeline latency.
+
+**How StreamPulse demonstrates this:**
+[`analyze_raw_topic.py`](../scripts/research/analyze_raw_topic.py), [Research 0002 §1.5–1.7](research/0002-ingestion-behaviour.md), and the early-evidence note in [ADR-0006](adr/0006-event-time-and-watermarks.md).
+
+**Potential follow-up question:**
+Why not just choose a very large watermark bound to be safe?
+
+**Follow-up answer:**
+Every result would wait that long: a 1-minute window with a 3-minute bound closes about 4 minutes late, for every window, all the time. The better design is a bound near p99, which keeps early results fast, plus allowed lateness near p99.99, which corrects them through idempotent upserts. Whatever is later still goes to a late topic. That's a latency versus completeness trade-off, set from data.
+
+---
+
+### Engineering practice
+
+**Question:** How do you keep a Python project's dependencies reproducible and safe from brand-new releases?
+
+**Difficulty:** Intermediate
+
+**Interview-ready answer:**
+`uv.lock` pins every package, transitive ones included, and CI runs `uv sync --locked`, which fails if the lock is stale. On top of that, `exclude-newer` in `pyproject.toml` makes the resolver ignore anything published after a cutoff. That enforces my "nothing younger than two weeks" rule across the whole tree, not only the packages I name. You can see it working: it resolved ruff 0.17.0 even though 0.17.1 existed, because 0.17.1 was published after the cutoff.
+
+**Deep technical explanation:**
+New releases are where regressions and occasional supply-chain incidents surface first. A short quarantine gives the ecosystem time to notice. The trade-off is slower uptake of security fixes, so the cutoff is a dated, reviewable line that gets moved forward deliberately, not a permanent freeze. The Docker image installs from the same lock (`uv sync --locked --no-dev`), so what runs is exactly what was tested.
+
+**How StreamPulse demonstrates this:**
+[`producer/pyproject.toml`](../producer/pyproject.toml) (`[tool.uv] exclude-newer`), `producer/uv.lock`, [`producer/Dockerfile`](../producer/Dockerfile), and the CI workflow.
+
+**Potential follow-up question:**
+What would you add for a production service?
+
+**Follow-up answer:**
+Automated dependency update PRs (Renovate or Dependabot) that respect the quarantine, vulnerability scanning of the lock and image (e.g. `pip-audit`, Trivy) in CI, hash-pinned base images, and an SBOM per release.
 
 ---
 

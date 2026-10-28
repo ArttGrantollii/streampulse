@@ -1,11 +1,11 @@
 # StreamPulse — Architecture
 
-> **Document status:** Phase 1 complete (local infrastructure). Sections are 📐 *designed* unless marked ✅ *Implemented*.
+> **Document status:** Phase 2 implemented (ingestion); 24-hour source measurement in progress. Sections are 📐 *designed* unless marked ✅ *Implemented*.
 > Status markers: ✅ Implemented · 🧪 Implemented, pending measurement · 📐 Designed (planned) · ❓ Open question.
 >
 > Every claim is labelled where it matters: **FACT** (documentation or direct observation), **DECISION** (our choice), **ASSUMPTION** (needs measurement), **EXPERIMENT** (scheduled test).
 >
-> Last updated: 2026-10-27 (Phase 1).
+> Last updated: 2026-10-28 (Phase 2).
 
 ## Contents
 1. [Overview and engineering objectives](#1-overview-and-engineering-objectives)
@@ -59,7 +59,7 @@ Non-goals for V1: ML, multi-region deployment, Kubernetes, and serving raw event
 |---|---|---|
 | Research, ADRs, roadmap | ✅ Implemented (documents) | 0 |
 | Docker Compose: Kafka, Flink, PostgreSQL, init jobs, smoke test | ✅ Implemented | 1 |
-| Python producer (live, replay, record) | 📐 | 2 |
+| Python producer (live, replay, record), CI | ✅ Implemented (24-hour measurement running) | 2 |
 | Flink parsing, validation, DLQ, watermarks, dedup, lateness | 📐 | 3 |
 | PostgreSQL schema, upsert sink, core analytics, local Grafana | 📐 | 3 |
 | Top-N, trending, spike detection and its validation | 📐 | 4 |
@@ -182,42 +182,80 @@ flowchart LR
 
 ## 5. Producer
 
-📐 Phase 2. Decisions: [ADR-0005](adr/0005-serialization-and-schema-contracts.md), [ADR-0012](adr/0012-producer-resume-from-kafka.md).
+✅ Implemented in Phase 2 ([`producer/`](../producer/)). 64 tests: 55 unit, 9 against the real broker. Decisions: [ADR-0005](adr/0005-serialization-and-schema-contracts.md), [ADR-0012](adr/0012-producer-resume-from-kafka.md). Evidence: [Research 0002](research/0002-ingestion-behaviour.md).
 
 **What and why:** a small Python service that turns the volatile SSE source into durable Kafka records, and replays recordings through the same publishing path.
 
-**How it works (design):**
+**How it works:**
 ```mermaid
 flowchart LR
-    subgraph Sources["EventSource implementations"]
-        L["LiveSseSource<br/>httpx stream · SSE parser<br/>backoff · Last-Event-ID"]
-        R["ReplaySource<br/>NDJSON · rate limiter<br/>(N ev/s or ×speed)"]
+    subgraph Sources["sources (yield RawEvent)"]
+        L["LiveSource (live.py)<br/>httpx stream · SseParser<br/>backoff · Last-Event-ID · since guard"]
+        R["ReplaySource (replay.py)<br/>NDJSON recording<br/>--speed X | --rate N | max"]
     end
-    REC["RecordSink<br/>(record mode)"]
-    PUB["KafkaPublisher<br/>key=(wiki|title) · headers<br/>delivery callbacks · metrics"]
+    PUB["KafkaPublisher (publisher.py)<br/>key=wiki|title · sp-* headers<br/>delivery callbacks · metrics"]
+    REC["RecordingWriter<br/>(record mode)"]
+    RES["resume (resume.py + kafka_position.py)<br/>last record per partition → since"]
+    RES --> L
     L --> PUB
     R --> PUB
     L --> REC
 ```
-- **One pipeline, interchangeable sources.** Both modes emit the same `RawEvent(sse_id, data_bytes, received_at)` into the same publisher, so replay tests the real publishing code.
-- **Bytes are forwarded verbatim.** The payload is parsed only far enough to extract the key, and parse failures produce a null key, not a dropped record. Metadata goes in headers: `sp-ingest-ts`, `sp-sse-id`, `sp-producer`, `sp-mode`.
-- **Kafka settings (DECISION):** `enable.idempotence=true`, `acks=all`, `compression.type=zstd`, `linger.ms=50`, `partitioner=murmur2_random` (Java-compatible; librdkafka's default is CRC32, which is FACT), and `delivery.timeout.ms` bounded.
-- **Reconnect:** a normal 15-minute close triggers an immediate reconnect. Errors trigger exponential backoff with full jitter (1 s → 60 s cap). The resume position is the last SSE id **acknowledged by Kafka**.
-- **Restart:** resume from the minimum last-acknowledged upstream timestamp across raw partitions, minus a margin ([ADR-0012](adr/0012-producer-resume-from-kafka.md)).
-- **Shutdown:** SIGTERM → stop reading → `flush()` with a timeout → exit 0. Any unflushed messages are counted and logged.
-- **Replay preserves** the original `sp-ingest-ts` and adds `sp-replayed-at`, so validation stays deterministic.
 
-**Communicates with:** Wikimedia (HTTPS out), Kafka (binary protocol), Prometheus (it serves `/metrics`).
+| Module | Responsibility |
+|---|---|
+| `sse.py` | WHATWG-conformant incremental SSE parser: multi-line data, comments, persistent `id`, `retry` |
+| `envelope.py` | Peeks at the payload for the key, `meta.dt` and canary flag only; never modifies or drops it |
+| `live.py` | Connect, stream and reconnect; backoff with full jitter; `since` sent as ISO-8601; checks that the first event matches the requested `since` |
+| `replay.py` | Pacing by recorded timing ×speed, fixed rate, or unpaced |
+| `publisher.py` | Produce with key, headers and timestamp; blocks on a full local queue (backpressure); counts acks and failures; `flush()` raises on any failure |
+| `resume.py`, `kafka_position.py` | Resume decision from the raw topic's last records (pure function plus Kafka reader) |
+| `clock.py` | SNTP clock-offset probe, exported as a metric |
+| `app.py`, `cli.py` | Wiring, signals and settings; every option also comes from `STREAMPULSE_*` env vars |
+
+**Key behaviour (each verified):**
+- **One pipeline, interchangeable sources.** Both modes emit the same `RawEvent` into the same publisher, so replay tests the real publishing code. Verified by the integration test replaying the fixture into a real broker.
+- **Bytes forwarded verbatim.** Malformed payloads are published with a null key, never dropped, so the Flink DLQ can see them. The integration test checks every record is byte-identical to the recording.
+- **Kafka settings:** `enable.idempotence=true`, `acks=all`, zstd, `linger.ms=50`, `delivery.timeout.ms=120000`, `partitioner=murmur2_random`. **Verified:** every record landed on the partition Java's `murmur2` would choose. The test implements Kafka's hash and matches all six reference values from Kafka 4.2.2's `UtilsTest`.
+- **Headers:** `sp-ingest-ts`, `sp-sse-id`, `sp-mode`, `sp-producer`, `sp-connection` (`live-<session>-<n>`), plus `sp-replayed-at` on replay. The Kafka record timestamp is the ingest time for live, and **the replay time for replay**, because retention deletes by record timestamp.
+- **Reconnect:**
+  - A connection that lived at least 60 s and delivered events reconnects immediately.
+  - Otherwise, exponential backoff with full jitter (1 s base, 60 s cap), honouring `Retry-After`.
+  - Before every reconnect the publisher is flushed, so `Last-Event-ID` refers to an acknowledged event. A delivery failure stops the producer instead of moving on.
+- **Restart:**
+  - Resume from the oldest last-record position across partitions, minus a 30 s margin ([ADR-0012](adr/0012-producer-resume-from-kafka.md)).
+  - **Measured:** overlap exactly 30.0 s, no gap.
+  - Guards: a `since` mismatch stops with exit 1; a resume point older than 24 h is refused with exit 2.
+- **Shutdown:** SIGTERM → stop reading → flush (up to 30 s) → exit 0. **Measured:** `docker stop` → exit 0 in 0.5 s. Compose `stop_grace_period` is 45 s.
+- **Replay preserves** the original `sp-ingest-ts`, so validation relative to ingest time is deterministic.
+
+**Deployment:** Docker image `streampulse-producer:0.1.0` (python:3.14.8-slim, uv-locked dependencies, non-root uid 10001). Compose service `producer` is under the **opt-in profile `live`** (`make ingest`), so `make up` alone never contacts Wikimedia or grows the raw topic.
+
+**Metrics (`:8000/metrics`):**
+- `events_received` and `events_produced` by mode;
+- `produce_errors` by reason;
+- `local_queue_full`;
+- `reconnects` by cause (`server_closed`, `timeout`, `network_error`, `http_<status>`);
+- `produce_latency_seconds` (histogram, aggregatable);
+- `source_delay_seconds` (receive − `meta.dt`; includes clock offset and, during a catch-up, the backlog's age);
+- `unparseable_events`, `canary_events`;
+- `last_event_emitted_timestamp_seconds`;
+- `clock_offset_seconds`.
+
+All names carry the `streampulse_producer_` prefix.
+
+**Communicates with:** Wikimedia (HTTPS out), Kafka (binary protocol), Prometheus (it serves `/metrics`, scraped from Phase 5), and an NTP server (one UDP query at startup).
 
 **Why Python:** an I/O-bound adapter with a mature client (librdkafka). This is the owner's strongest language, and the logic is simple.
 
-**Alternatives:** Kafka Connect with an SSE source connector (heavier, with less control over resume semantics), or a Java producer (no benefit here).
+**Alternatives:** Kafka Connect with an SSE source connector (heavier, with less control over resume semantics), or a Java producer (no benefit here). For the HTTP client, httpx (sync streaming) was chosen over `requests` for explicit per-phase timeouts and a mock transport that makes reconnect logic testable without the network. The SSE parser is our own, about 60 lines, because we need exact control of `id` semantics.
 
 **If it fails:**
-- Kafka down: the client buffers until `delivery.timeout.ms`, then reports errors, and the producer stops reading upstream (backpressure) instead of dropping events.
-- Producer crash: in-flight records are lost from Kafka but are re-fetched on resume.
+- **Kafka down:** the client retries until `delivery.timeout.ms` (2 min). A full local queue blocks reading upstream (backpressure). A failed delivery makes `flush()` raise and the producer exit 1; Compose restarts it, and it resumes from Kafka's last position.
+- **Producer crash:** in-flight records are lost from Kafka but re-fetched on resume (overlap = margin).
+- **Wikimedia ignores or misreads the resume request:** detected at the first event (guard), and the producer stops instead of ingesting the wrong period.
 
-**At production scale:** run it as a single active instance with leader election, or partition by upstream stream. Its health is part of the SLO.
+**At production scale:** run it as a single active instance with leader election, or partition by upstream stream. Its health is part of the SLO. An internal WMF team would consume Kafka directly instead of SSE.
 
 ## 6. Kafka topology
 
@@ -616,11 +654,11 @@ ADRs: [index](adr/README.md). Versions: [COMPATIBILITY.md](COMPATIBILITY.md). Ro
 Items marked ✅ exist. The rest is the target; directories are created in the phase that first needs them.
 ```text
 streampulse/
-├── producer/                 # Python: live | replay | record (Phase 2)
-│   ├── src/streampulse_producer/
-│   ├── tests/
-│   ├── pyproject.toml
-│   └── Dockerfile
+├── producer/                 # ✅ Python 3.14: live | replay | record
+│   ├── src/streampulse_producer/   # ✅ sse, live, replay, publisher, resume, clock, …
+│   ├── tests/                      # ✅ unit + integration (real Kafka)
+│   ├── pyproject.toml, uv.lock     # ✅ exclude-newer enforces the two-week rule
+│   └── Dockerfile                  # ✅
 ├── flink-jobs/               # ✅ Java 17, Maven. Phase 1 smoke job; Phase 3+ analytics
 │   ├── src/main/java/io/github/arttgrantollii/streampulse/smoke/   # ✅ SmokeJob, CountRecords
 │   ├── src/test/java/...                                           # ✅ operator-harness tests
@@ -636,8 +674,9 @@ streampulse/
 ├── schemas/
 │   ├── wikimedia/recentchange-1.0.1.yaml   # vendored upstream contract
 │   └── streampulse/{dlq-record,late-record}.v1.json
-├── sample-data/              # small committed fixtures only; large recordings gitignored
-├── scripts/                  # ✅ smoke_test.sh, wait_for_stack.sh, research/; failure_test (Phase 5)
+├── sample-data/fixtures/     # ✅ recentchange-120.ndjson (+ attribution); large recordings gitignored
+├── scripts/                  # ✅ smoke_test.sh, wait_for_stack.sh, research/ (incl. analyze_raw_topic.py); failure_test (Phase 5)
+├── .github/workflows/ci.yml  # ✅ producer lint+unit, integration (real Kafka), Flink build, compose+shellcheck
 ├── tests/e2e/                # cross-component tests (replay → Kafka → Flink → PostgreSQL)
 ├── docs/
 │   ├── ARCHITECTURE.md  INTERVIEW_QUESTIONS.md  LEARNING_JOURNAL.md

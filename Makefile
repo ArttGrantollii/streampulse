@@ -11,7 +11,7 @@ export HOST_GID := $(shell id -g)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help up down restart ps logs build-jobs smoke-test topics clean
+.PHONY: help up down restart ps logs build-jobs smoke-test topics ingest ingest-stop ingest-logs test-producer clean
 
 help: ## List available commands
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-12s %s\n", $$1, $$2}'
@@ -41,6 +41,18 @@ build-jobs: .env ## Build and unit-test the Flink job jar (in a Maven container)
 
 smoke-test: ## Verify Kafka -> Flink -> checkpoints end to end (needs up + build-jobs)
 	./scripts/smoke_test.sh
+
+ingest: ## Start live ingestion from Wikimedia into Kafka (needs up)
+	$(COMPOSE) --profile live up -d --build producer
+
+ingest-stop: ## Stop live ingestion gracefully (flushes in-flight events)
+	$(COMPOSE) --profile live stop producer
+
+ingest-logs: ## Follow the producer's structured logs
+	$(COMPOSE) --profile live logs -f --tail=50 producer
+
+test-producer: ## Lint + unit tests + integration tests of the producer (integration needs up)
+	cd producer && uv sync --locked && uv run ruff check . && uv run ruff format --check . && uv run pytest
 
 topics: ## Describe the StreamPulse Kafka topics
 	$(COMPOSE) exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe

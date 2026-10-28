@@ -1,6 +1,6 @@
 # Technology compatibility matrix
 
-Researched **2026-10-26** (Phase 0). Rows marked ✅ **run in our stack** (Phase 1, 2026-10-27). Decision record: [ADR-0003](adr/0003-version-baseline.md).
+Researched **2026-10-26** (Phase 0). Rows marked ✅ **run in our stack** (Phases 1–2, 2026-10-27/28). Decision record: [ADR-0003](adr/0003-version-baseline.md).
 
 **Selection rules:**
 1. Use the newest *stable* release that is compatible with every connector we need.
@@ -20,10 +20,15 @@ Researched **2026-10-26** (Phase 0). Rows marked ✅ **run in our stack** (Phase
 | flink-metrics-prometheus | ships with Flink 2.2.1 | Phase 5 | [Metric reporters](https://nightlies.apache.org/flink/flink-docs-release-2.2/docs/deployment/metric_reporters/) | `PrometheusReporterFactory`, default port 9249. **Flink histograms are exported as Prometheus *summaries*** (per-instance quantiles that can't be aggregated). This shapes the latency design |
 | **Apache Kafka (broker)** ✅ | **4.2.2** (`apache/kafka:4.2.2`, 2026-09-28) | Phase 1 | [kafka.apache.org/community/downloads](https://kafka.apache.org/community/downloads/), Docker Hub | Kafka 4.x is KRaft-only (no ZooKeeper). Supported lines: 4.3.1, 4.2.2, 4.1.2. We chose **4.2.2** because it matches the 4.2 client line the Flink connector is built and tested against, and it is the most recently patched supported release that is more than two weeks old. 4.3.x is acceptable but brings no feature we need |
 | Kafka image ✅ | `apache/kafka:4.2.2` | Phase 1 | Docker Hub | The official Apache image (JVM-based), running as `appuser`. `KAFKA_*` environment variables map to broker properties, and KRaft mode requires `CLUSTER_ID` |
-| **Python (producer)** | **3.14** line (`python:3.14.x-slim`) | Phase 2 | python.org | Matches the dev machine (3.14.4). 3.14.9 was released 2026-10-21, too recently, so we pin the newest patch that is ≥ 2 weeks old when Phase 2 starts |
-| confluent-kafka (librdkafka) | 2.16.x | Phase 2 | PyPI | The mature Python Kafka client with cp314 wheels. **Its defaults differ from the Java client:** `enable.idempotence=false` and `partitioner=consistent_random` (CRC32, not Java's murmur2). We override both. 2.16.0 is 19 days old at the time of writing |
-| pydantic | 2.x | Phase 2 (tests) | PyPI | Only if typed producer-side models prove useful. The producer forwards raw bytes, see [ADR-0005](adr/0005-serialization-and-schema-contracts.md) |
-| prometheus-client (Python) | 0.26.x | Phase 2 | PyPI | Native Prometheus histograms for producer latency |
+| **Python (producer)** ✅ | **3.14.8** (`python:3.14.8-slim-trixie`, released 2026-09-30) | Phase 2 | python.org | Matches the dev machine (3.14.4). 3.14.9 and 3.14.10 are less than two weeks old |
+| confluent-kafka (librdkafka) ✅ | **2.16.0** | Phase 2 | PyPI | The mature Python Kafka client with cp314 wheels. **Its defaults differ from the Java client:** `enable.idempotence=false` and `partitioner=consistent_random` (CRC32, not Java's murmur2). We override both. **Verified:** with `murmur2_random`, every record lands on the partition Java's murmur2 would choose (integration test) |
+| pydantic | — (not used) | — | — | Not needed: the producer forwards raw bytes and peeks at three fields ([ADR-0005](adr/0005-serialization-and-schema-contracts.md)). Adding it would be technology for its own sake |
+| httpx ✅ | **0.28.1** | Phase 2 | PyPI | The latest *stable* release (1.0 is still `dev`). Sync streaming, explicit timeouts, and `MockTransport` for network-free tests of reconnect logic |
+| structlog ✅ | **26.1.0** | Phase 2 | PyPI | Structured JSON logs |
+| uv ✅ | **0.13.0** in the image (`ghcr.io/astral-sh/uv:0.13.0`); `exclude-newer = 2026-10-14` in `pyproject.toml` | Phase 2 | GitHub releases | `exclude-newer` enforces the two-week rule on the **whole** tree, transitive dependencies included. Proof: it resolved ruff 0.17.0, not 0.17.1 (released 2026-10-15) |
+| pytest / ruff ✅ | **9.1.1** / **0.17.0** | Phase 2 | PyPI | Resolved under the same cutoff |
+| GitHub Actions ✅ | `actions/checkout@v7`, `astral-sh/setup-uv@v10.2.0`, `actions/setup-java@v6` | Phase 2 | GitHub API | Same versions as SparkShift, whose CI passes with them |
+| prometheus-client (Python) ✅ | **0.26.0** | Phase 2 | PyPI | Native Prometheus histograms for producer latency (aggregatable, unlike Flink's summaries) |
 | **PostgreSQL** ✅ | **18.6** (`postgres:18.6-bookworm`, released 2026-08-13) | Phase 1 | [Versioning policy](https://www.postgresql.org/support/versioning/) | The newest major, supported until Nov 2030. We use Debian rather than Alpine for glibc locale/collation predictability. **The 18 image moved data to `/var/lib/postgresql/18/docker`; mount the volume at `/var/lib/postgresql`** |
 | Migration tool ✅ | **Flyway 13.10.0** (`flyway/flyway:13.10.0-alpine`, 2026-10-08) | Phase 1 | GitHub releases, Docker Hub | Industry-standard versioned SQL migrations, run as a one-shot container. Flyway releases weekly, so 13.10.0 was the newest release more than two weeks old. The alpine variant is about 130 MB smaller |
 | Java test stack ✅ | JUnit **5.11.4**, AssertJ **3.27.3**, Log4j **2.24.3** + `log4j-slf4j-impl`, SLF4J **1.7.36** (provided) | Phase 1 | flink-parent 2.2.1 POM | Aligned with what Flink's own test utilities and runtime use, to avoid classpath conflicts. JUnit 6 is newer but not what `flink-test-utils` is built on |
