@@ -323,3 +323,39 @@ Phase 2: the Python producer that makes Wikimedia's live stream durable in Kafka
 
 ### Key takeaway
 Before relying on "these can't conflict", check what is actually shared. Namespaces and artifacts aren't the same thing.
+
+---
+
+## Phase 3b — Flink ingestion job and DLQ
+
+**Date:** 2026-10-28 · *Subphase entry (short form).*
+
+### What we built
+- **`StreamPulseJob`**, the first real job: Kafka source on `raw.v1`, a router that sends valid events on, DLQ records to a side output and drops canaries, and an at-least-once Kafka sink for `dlq.v1`.
+  - Valid events end in a placeholder sink until 3c.
+  - The pipeline is built in `IngestionPipeline`, separate from `main`, so tests run the same code with test sinks.
+- **`RawRecordDeserializer`:** parsing happens inside the Kafka source.
+- **Custom metrics:** valid, canary, and DLQ-by-reason counters.
+- **Tests:**
+  - 5 fast tests: deserializer, including a tombstone, and the router through Flink's test harness;
+  - 1 integration test running the real pipeline on a Flink mini-cluster against real Kafka, in CI and via `make test-jobs-integration`.
+
+### Concepts learned
+- **Parse at the source when watermarks depend on the content:** per-partition watermarks are generated in the source, so the source must already know each record's event time.
+- **A deserializer must never throw on bad data,** or one poison record restarts the job forever. Bad data becomes a DLQ record instead.
+- **Operator chaining:** without a `keyBy`, the whole job ran as one task, with records passed as method calls and no serialization.
+- **Forbidding Kryo** (`pipeline.generic-types: false`) shapes the data model: the types between operators must be plain POJOs.
+
+### Problems encountered and solutions
+1. **Pattern-matching `switch` doesn't compile for Java 17** (it's a Java 21 feature), and the job targets 17, Flink's recommended JVM. Rewritten with `instanceof` patterns.
+2. **`DeliveryGuarantee` wasn't on the classpath.** It's in `flink-connector-base`, which the Kafka connector declares `provided`. I checked the image: it ships inside `flink-dist`, so the job declares it `provided` too.
+3. **A record component and a static method with the same name** (`jobVersion`) collided with the record's generated accessor. Renamed the helper to `buildVersion()`.
+4. **False green:** the integration test reported "Tests run: 0 … BUILD SUCCESS". Surefire only selects `*Test`/`*Tests`/`Test*` classes, and `*IT` is Failsafe's convention. I renamed it, then **ran a mutation check**: disabling the canary filter made the test fail ("expected 120 but was 121"), proving it has teeth.
+5. **My live injection wrote a nanosecond `sp-ingest-ts`.** The WSL `date +%s%3N` doesn't truncate to milliseconds, the same gotcha as in Phase 2. It was harmless because the record was meant to be invalid, but it showed that the parser trusts the header, so this is now a documented limitation.
+
+### How we verified
+- **53 fast tests** and **1 integration test** pass. The integration test checks that exactly the 120 fixture events come out, the canary is dropped, and 3 crafted rejects land in `dlq.v1` with the right reasons.
+- **Live on the cluster:** the job ran with Kryo forbidden; 16,591 valid events in about 6 min; one injected malformed record appeared in `dlq.v1` with full context.
+
+### Key takeaway
+"BUILD SUCCESS" isn't evidence. Check how many tests actually ran, and break the code once to see the test fail.

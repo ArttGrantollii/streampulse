@@ -11,14 +11,14 @@ import java.util.List;
 import java.util.Map;
 
 /** Test helpers: raw records from the shared fixture, and hand-made payloads. */
-final class Fixtures {
+public final class Fixtures {
 
     /** Tests run with flink-jobs/ as the working directory (Maven basedir). */
-    static final Path REPO_ROOT = Path.of("..").toAbsolutePath().normalize();
-    static final Path RECENTCHANGE_120 = REPO_ROOT.resolve("sample-data/fixtures/recentchange-120.ndjson");
+    public static final Path REPO_ROOT = Path.of("..").toAbsolutePath().normalize();
+    public static final Path RECENTCHANGE_120 = REPO_ROOT.resolve("sample-data/fixtures/recentchange-120.ndjson");
 
     /** 2026-10-28T12:00:00Z: the ingest time used by hand-made records. */
-    static final long INGEST_MS = 1_793_188_800_000L;
+    public static final long INGEST_MS = 1_793_188_800_000L;
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
@@ -26,7 +26,7 @@ final class Fixtures {
     }
 
     /** The committed recording as raw records, with the headers the producer would have set. */
-    static List<RawRecord> recording() {
+    public static List<RawRecord> recording() {
         try {
             List<String> lines = Files.readAllLines(RECENTCHANGE_120, StandardCharsets.UTF_8);
             return java.util.stream.IntStream.range(0, lines.size()).mapToObj(i -> {
@@ -54,7 +54,7 @@ final class Fixtures {
     }
 
     /** A valid edit payload; tests replace or remove parts of it as JSON text. */
-    static String edit() {
+    public static String edit() {
         return """
                 {"$schema":"/mediawiki/recentchange/1.0.0",
                  "meta":{"id":"f473e767-1f26-4d08-88d4-48001c7585f9","dt":"2026-10-28T11:59:58.500Z",

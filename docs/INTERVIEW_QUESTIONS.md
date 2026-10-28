@@ -26,6 +26,7 @@ Difficulty: **Fundamental** (do you understand the concept?) · **Intermediate**
   - [Engineering practice](#engineering-practice)
 - [Phase 3 — Correct stream processing](#phase-3--correct-stream-processing)
   - [3a: Contract and validation](#3a-contract-and-validation)
+  - [3b: Ingestion job](#3b-ingestion-job)
 - [Senior-level system design scenarios](#senior-level-system-design-scenarios)
 
 ---
@@ -810,6 +811,50 @@ What else can break restoring state after a code change?
 - **Changed key types or `maxParallelism`:** key groups would no longer line up.
 
 The defence is a savepoint-restore test in CI before deploying, which is planned for Phase 5.
+
+---
+
+### 3b: Ingestion job
+
+**Question:** Where in your Flink job do you parse events, and why there?
+
+**Difficulty:** Advanced
+
+**Interview-ready answer:**
+Inside the Kafka source, in its `KafkaRecordDeserializationSchema`, rather than in a `map` after the source. The reason is event time. Flink generates watermarks per Kafka partition only when the watermark strategy is attached at the source, and to do that the source has to know each record's event time, which means the event has to be parsed already. Parsing anywhere later would force me to assign watermarks after the source, losing per-partition tracking: one fast partition could then make another partition's normal events look late. Parsing once also saves a second JSON pass.
+
+**Deep technical explanation:**
+The deserializer must never throw on bad data. If it throws, the source task fails, the job restarts from the last checkpoint, reads the same record again and fails again: an endless restart loop on one poison record. Instead, every input produces exactly one output: either a parsed `EditEvent` or a ready-made DLQ record. A router then splits them into a side output. Because I also forbid Kryo, the source's output type has to be a flat POJO (`SourceRecord`), not a `Map` or an interface.
+
+**How StreamPulse demonstrates this:**
+[`RawRecordDeserializer`](../flink-jobs/src/main/java/io/github/arttgrantollii/streampulse/job/RawRecordDeserializer.java), [`SourceRecord`](../flink-jobs/src/main/java/io/github/arttgrantollii/streampulse/job/SourceRecord.java), [`RouteParsedRecords`](../flink-jobs/src/main/java/io/github/arttgrantollii/streampulse/job/RouteParsedRecords.java), and `IngestionPipelineIntegrationTest` (real Kafka, mini-cluster).
+
+**Potential follow-up question:**
+What if parsing becomes the bottleneck?
+
+**Follow-up answer:**
+Source parallelism is capped by the partition count (3 here), so a CPU-bound parse would first need more partitions. Before that, I'd measure with Flink's busy and backpressured time (Phase 5). At about 50 events per second it's far from a bottleneck. If it ever were, options include a faster JSON parser, parsing only the fields we need with a streaming parser, or more partitions.
+
+---
+
+**Question:** What delivery guarantee does your DLQ sink have, and why not exactly-once?
+
+**Difficulty:** Intermediate
+
+**Interview-ready answer:**
+At-least-once. After a failure, Flink replays from the last checkpoint, so a DLQ record written since then can be written again. A duplicate DLQ entry is harmless: it's for humans and debugging tools, and each record identifies its raw record exactly by topic, partition and offset, so duplicates are easy to spot. Exactly-once would mean Kafka transactions committed on each checkpoint: DLQ records would only become visible every 30 seconds, and I'd have to manage transaction timeouts and transactional IDs, all to deduplicate debug output.
+
+**Deep technical explanation:**
+`KafkaSink` with `AT_LEAST_ONCE` flushes pending records when each checkpoint is taken and at the end of input, so nothing acknowledged by the checkpoint is lost. `EXACTLY_ONCE` would also need `transaction.timeout.ms` greater than the maximum checkpoint duration plus restart time, a unique transactional ID prefix, and `read_committed` consumers. Worth it for a business stream with several consumers; not for a debug stream.
+
+**How StreamPulse demonstrates this:**
+`IngestionPipeline.dlqSink` and [ADR-0008](adr/0008-postgres-sink-semantics.md) (per-boundary guarantees).
+
+**Potential follow-up question:**
+How do you reprocess DLQ records after fixing the parser?
+
+**Follow-up answer:**
+Each DLQ record holds the raw record's topic, partition and offset. The simplest correct approach is to replay that raw range through the fixed job, since raw is retained for 7 days. Downstream writes are idempotent upserts, so the results converge. I wouldn't re-parse the DLQ's `raw_value`, because it may be truncated at 64 K characters and has passed through a UTF-8 replacement.
 
 ---
 

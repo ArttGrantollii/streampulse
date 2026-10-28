@@ -11,7 +11,7 @@ export HOST_GID := $(shell id -g)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help up down restart ps logs build-jobs smoke-test topics ingest ingest-stop ingest-logs test-producer clean
+.PHONY: help up down restart ps logs build-jobs test-jobs-integration smoke-test topics ingest ingest-stop ingest-logs test-producer clean
 
 help: ## List available commands
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-12s %s\n", $$1, $$2}'
@@ -38,6 +38,11 @@ logs: ## Follow logs of all services (Ctrl+C to stop)
 
 build-jobs: .env ## Build and unit-test the Flink job jar (in a Maven container)
 	$(COMPOSE) --profile build run --rm flink-jobs-build
+
+test-jobs-integration: .env ## Flink pipeline on a mini-cluster against the stack's Kafka (needs up)
+	$(COMPOSE) --profile build run --rm -e STREAMPULSE_TEST_KAFKA=kafka:9092 flink-jobs-build \
+		mvn -B -ntp -Dmaven.repo.local=/workspace/flink-jobs/.m2/repository \
+		-Dsurefire.excludedGroups=none -Dsurefire.groups=integration verify
 
 smoke-test: ## Verify Kafka -> Flink -> checkpoints end to end (needs up + build-jobs)
 	./scripts/smoke_test.sh

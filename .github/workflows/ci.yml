@@ -90,6 +90,32 @@ jobs:
       - run: mvn -B -ntp verify
         working-directory: flink-jobs
 
+  flink-integration:
+    name: Flink jobs (integration, real Kafka)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Start Kafka from docker-compose.yml
+        run: |
+          cp .env.example .env
+          docker compose up -d kafka kafka-init
+          docker compose wait kafka-init
+
+      # Tests tagged "integration": the real pipeline on a Flink mini-cluster against Kafka.
+      - run: mvn -B -ntp verify -Dsurefire.excludedGroups=none -Dsurefire.groups=integration
+        working-directory: flink-jobs
+
+      - name: Kafka logs on failure
+        if: failure()
+        run: docker compose logs kafka kafka-init
+
   compose:
     name: Compose file and scripts
     runs-on: ubuntu-latest

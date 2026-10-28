@@ -76,7 +76,7 @@ The first draft had 12 phases. It was cut to **6** to make sure the project ship
   | Step | Builds | Done when |
   |---|---|---|
   | **3a** ✅ | `EditEvent` contract, parser/validator, DLQ record schema (plain Java, no cluster) | Unit tests for every rejection reason and the real edge cases (2005 timestamp, unknown fields); the fixture parses; `EditEvent` uses Flink's POJO serializer, not Kryo |
-  | **3b** | Flink job: Kafka source → parse → DLQ sink; canary filter | Mini-cluster integration test; runs on the live raw topic; an injected malformed record lands in the DLQ with its reason |
+  | **3b** ✅ | Flink job: Kafka source → parse → DLQ sink; canary filter | Mini-cluster integration test; runs on the live raw topic; an injected malformed record lands in the DLQ with its reason |
   | **3c** | Event time and watermarks from the 24-hour parameters; first 1-minute window to logs | Out-of-order tests; watermark visible in the Flink UI |
   | **3d** | Dedup (`meta.id`, TTL) and allowed lateness → `late.v1` | Operator-harness tests with injected duplicates and late events |
   | **3e** | PostgreSQL schema, upsert sink, `dim_wiki` | Replaying the same fixture twice leaves identical tables |

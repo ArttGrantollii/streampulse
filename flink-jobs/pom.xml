@@ -25,6 +25,11 @@
         <log4j.version>2.24.3</log4j.version>
         <slf4j.version>1.7.36</slf4j.version>
         <jackson.version>2.18.2</jackson.version>
+
+        <!-- Fast tests by default; Kafka-backed tests (JUnit tag "integration") on demand:
+             mvn verify -Dsurefire.excludedGroups=none -Dsurefire.groups=integration -->
+        <surefire.groups></surefire.groups>
+        <surefire.excludedGroups>integration</surefire.excludedGroups>
     </properties>
 
     <dependencies>
@@ -38,6 +43,14 @@
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-clients</artifactId>
+            <version>${flink.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- DeliveryGuarantee and other Sink V2 base classes. Ships inside flink-dist (lib/), and
+             the Kafka connector declares it provided, so we do too: no second copy in the jar. -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-base</artifactId>
             <version>${flink.version}</version>
             <scope>provided</scope>
         </dependency>
@@ -126,6 +139,13 @@
     <build>
         <!-- Stable name so the JobManager mount path never changes between versions. -->
         <finalName>streampulse-flink-jobs</finalName>
+        <resources>
+            <!-- Filtering writes ${project.version} into streampulse-job.properties. -->
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>true</filtering>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -136,6 +156,10 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.5.6</version>
+                <configuration>
+                    <groups>${surefire.groups}</groups>
+                    <excludedGroups>${surefire.excludedGroups}</excludedGroups>
+                </configuration>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

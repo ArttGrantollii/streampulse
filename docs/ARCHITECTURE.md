@@ -344,7 +344,21 @@ EditEvent v1
 
 ## 8. Flink job topology
 
-📐 Phases 3–4. Decision: [ADR-0002](adr/0002-flink-java-over-pyflink.md).
+✅ Ingestion stage implemented in **Phase 3b** ([`job/`](../flink-jobs/src/main/java/io/github/arttgrantollii/streampulse/job/)). 📐 Event time, dedup, windows and sinks come in 3c–3e. Decision: [ADR-0002](adr/0002-flink-java-over-pyflink.md).
+
+**Implemented (3b), as running on the cluster:**
+```mermaid
+flowchart LR
+    S["KafkaSource raw.v1<br/>RawRecordDeserializer<br/>(parses here)"] --> R["route: valid / dlq / canary<br/>(RouteParsedRecords)"]
+    R -- "side output: DLQ JSON" --> D["KafkaSink dlq.v1<br/>AT_LEAST_ONCE"]
+    R -- "EditEvent" --> P["edit events<br/>(discarding placeholder until 3c)"]
+```
+- **Parsing happens in the source's deserializer, not in a later operator.** Event-time watermarks (3c) must be generated *in the source, per Kafka partition*, which requires each record's event time to be known there. It also means a single JSON pass. The deserializer never throws: an exception there would fail the source and restart the job in a loop on the same bad record.
+- **Kryo is forbidden** (`pipeline.generic-types: false` in `StreamPulseJob.environment()`). The source therefore emits a flat `SourceRecord(EditEvent event, String dlqReason, String dlqJson)` instead of maps, byte arrays or an interface. Verified: the job starts and runs on the cluster with this setting.
+- **Operator chaining (observed in the Flink UI):** source → router → both sinks run as **one chained task**. There's no `keyBy`, so no network shuffle; records pass as method calls. The first `keyBy` (dedup, 3d) will add the first shuffle.
+- **Metrics** (operator group `streampulse`): `validEvents`, `canaryDropped`, and `dlqRecords` with a `reason` label (e.g. `reason.invalid_json.dlqRecords`).
+- **Starting position** (`--starting-offsets`): `committed` (default: the group's committed offsets, falling back to earliest), `earliest` or `latest`. On restore from a checkpoint, Flink always uses the checkpointed offsets.
+- **Live check (2026-10-28):** 16,591 valid events in about 6 min (~45/s), 0 canaries, and 1 injected malformed record delivered to `dlq.v1` with reason, detail, payload and its raw-topic partition and offset.
 
 There is a single job, `streampulse-analytics`, in a session cluster (1 JobManager, 1 TaskManager, initial parallelism 2, an ASSUMPTION).
 
@@ -448,7 +462,7 @@ Both formulas are fixed only after replaying a 24 h recording (EXPERIMENT).
 
 ## 13. Invalid events and the DLQ
 
-✅ DLQ record contract and rejection rules implemented in Phase 3a ([`schemas/streampulse/dlq-record.v1.json`](../schemas/streampulse/dlq-record.v1.json); `DlqRecordTest` validates real output against the schema). 📐 The Kafka DLQ sink comes in 3b.
+✅ DLQ record contract and rejection rules implemented in Phase 3a ([`schemas/streampulse/dlq-record.v1.json`](../schemas/streampulse/dlq-record.v1.json); `DlqRecordTest` validates real output against the schema). ✅ The Kafka DLQ sink is implemented in 3b (`IngestionPipeline.dlqSink`, `AT_LEAST_ONCE`), verified end to end by `IngestionPipelineIntegrationTest` and a live injection.
 
 | Category | Example | Route | Metric |
 |---|---|---|---|
@@ -665,6 +679,7 @@ ADRs: [index](adr/README.md). Versions: [COMPATIBILITY.md](COMPATIBILITY.md). Ro
 - `timestamp` has 1-second resolution;
 - source-delay latency is affected by clock skew;
 - dedup horizon is 1 h;
+- the producer's `sp-ingest-ts` header is trusted: time bounds are relative to it, and a corrupted header (e.g. nanoseconds instead of milliseconds) would skew validation. It can't be cross-checked against the Kafka timestamp, because replay legitimately sets those far apart. Accepted because only our producer writes the raw topic;
 - results are only as deterministic as the watermark behaviour (see the ADR-0006 hazards).
 
 ## 23. Repository structure
