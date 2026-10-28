@@ -91,3 +91,99 @@ A critical review of the Phase 0 plan before any code was written.
 ### Key takeaways
 - Review the plan honestly before building: ask what a reviewer will actually see and what makes it different.
 - Separate the system you engineer from the experience you publish.
+
+---
+
+## Phase 1 — Infrastructure foundation
+
+**Date:** 2026-10-27
+
+### Milestone
+Phase 1: the local platform. Kafka, Flink and PostgreSQL start with one command, provision themselves, and are verified end to end by an automated smoke test.
+
+### What we built
+- **`docker-compose.yml`** with four long-running services, each health-checked:
+  - Kafka 4.2.2 in KRaft combined mode;
+  - PostgreSQL 18.6;
+  - a Flink 2.2.1 JobManager;
+  - a Flink 2.2.1 TaskManager.
+- **Three one-shot init services:**
+  - `kafka-init` creates topics and enforces configs;
+  - `db-migrate` runs Flyway migrations;
+  - `flink-data-init` prepares the checkpoint volume.
+- **A containerised Maven build** (`flink-jobs-build`), so no JDK or Maven is needed on the host.
+- **Flink cluster configuration** kept in the repository (`infra/flink/flink-properties.yaml`) and loaded through the image's own `FLINK_PROPERTIES` mechanism.
+- **A Java smoke job**, `SmokeJob` plus `CountRecords`: it reads a Kafka topic, counts records in RocksDB keyed state, and checkpoints. Two operator-harness unit tests cover it, including snapshot and restore.
+- **Scripts:**
+  - `scripts/smoke_test.sh` produces 500 records, checks the job counts exactly 500, waits for checkpoints, checks the checkpoint files and committed offsets, and checks that the checkpoint is retained after cancel. It prints PASS or FAIL.
+  - `scripts/wait_for_stack.sh` decides when the stack is ready.
+- **A `Makefile`**, with each target a thin wrapper around a documented Compose command.
+
+### Concepts learned
+- **KRaft:** Kafka now stores its own metadata in a Raft-replicated log on controller nodes, replacing ZooKeeper. Combined mode (one node as both broker and controller) is fine locally and fragile in production.
+- **Advertised listeners:** clients bootstrap from one address, then use whatever addresses the broker *advertises* in metadata. Containers and the host need different ones (`kafka:9092` vs `localhost:9094`).
+- **Health checks vs readiness:** "the process started" isn't "ready". The TaskManager is healthy only once it has registered with the JobManager.
+- **Idempotent provisioning:** init steps that can be re-run safely. Running them twice changed nothing, which I verified.
+- **Flink offsets live in checkpoints.** Committed consumer-group offsets only reached the end of the topic *after* a checkpoint completed. They exist for monitoring, not for recovery.
+- **Checkpoint anatomy:** `chk-N/_metadata` (written by the JobManager), `shared/` (incremental SST files referenced by several checkpoints) and `taskowned/`. The JobManager and TaskManagers must see the same path.
+- **Keyed-state recovery in miniature:** the harness test snapshots state, restores it into a brand-new operator, and counting continues from 2 to 3.
+- **Provided vs shaded dependencies:** the cluster supplies Flink and SLF4J; the job jar must carry connectors.
+- **Transactional DDL:** PostgreSQL rolled back a broken migration completely.
+
+### Why we did it this way
+- **Health and completion conditions instead of sleeps**, so the startup order expresses real requirements rather than timing guesses.
+- **Configuration file plus the image's own mechanism**, instead of mounting `config.yaml`. The entrypoint writes to the config file at startup, so a mounted repository file would be modified or fail as read-only.
+- **The smoke test verifies the riskiest compatibility assumption first** (connector 5.0.0-2.2 + broker 4.2.2 + Flink 2.2.1), before any business logic depends on it.
+- **The test stack is aligned with Flink's own** (JUnit 5.11.4, AssertJ 3.27.3) rather than the newest versions, to avoid classpath conflicts with `flink-test-utils`.
+
+### Problems encountered
+1. **First build failed: `package org.slf4j does not exist`.** Flink 2.2's POMs don't pass `slf4j-api` through to job projects.
+2. **`docker compose up --wait` was non-deterministic.** It returned exit code 0 on one run and 1 on the next ("container db-migrate exited (0)"), and once returned before the TaskManager was healthy. It treats successfully exited init containers as failures.
+3. **The smoke test reported the wrong checkpoint.** It printed `chk-1` while `chk-2` existed. My `grep … | tail -1` took the last `external_path` in the REST response, which is the *oldest* history entry. The check passed, but it would have broken once retention deleted old checkpoints. This is a test that passed for the wrong reason.
+4. **Noise: "WARNING: Unknown module: jdk.compiler specified to --add-exports"** on every `flink` CLI call. The image's default JVM flags export a module that its own JRE doesn't contain.
+5. **`make` is not installed** in the WSL distro.
+6. **A clean-room run (fresh volumes, no build output) failed to build.**
+   - The JobManager bind-mounted `flink-jobs/target`. Because it didn't exist yet, Docker created it **owned by root**, and the Maven container (running as my uid) then failed with "could not create parent directories".
+   - Earlier runs had hidden this because `target/` already existed.
+   - `make up` would also have hidden it (the Makefile created the directory first), but a plain `docker compose up`, which is the PowerShell path, would not.
+7. **Gotchas caught by reading the images before they caused damage:**
+   - The PostgreSQL 18 image moved its data directory (`/var/lib/postgresql/18/docker`); mounting the familiar `/var/lib/postgresql/data` would have left the real data in an anonymous volume.
+   - A new named volume is owned by root, but Flink runs as uid 9999.
+   - The image's `FLINK_PROPERTIES` parser strips all whitespace and doesn't understand comments.
+   - Setting `MAVEN_CONFIG` would inject its value into Maven's command line. Confirmed in the launcher source: `MAVEN_CMD_LINE_ARGS="$MAVEN_CONFIG $@"`.
+
+### How we solved them
+1. Declared `slf4j-api` 1.7.36 as `provided`, matching the version in the flink-parent POM. The runtime supplies it from `lib/`.
+2. Wrote `scripts/wait_for_stack.sh`, which waits for long-running services to be `healthy` and one-shot services to have exited 0. If an init service fails, it prints that service's logs. I tested the failure path with a deliberately broken migration: it exited 1 and printed Flyway's syntax error.
+3. Inspected the REST JSON (key order: `counts`, `summary`, `latest`, `history`) and took the *first* `external_path`, which is `latest.completed`. A re-run reported `chk-2` correctly.
+4. Filtered only that exact warning from the CLI's stderr; all other errors still show.
+5. Documented `sudo apt install make` as a prerequisite, plus a no-make table in the README. I ran every target's underlying command directly to verify it.
+6. The shade plugin now writes the jar to `flink-jobs/dist/`, a directory committed with a `.gitkeep`. It always exists and is owned by whoever cloned the repo, and `mvn clean` never removes it. The clean-room run then passed.
+7. For the gotchas:
+   - mounted the PostgreSQL volume at `/var/lib/postgresql`;
+   - added the `flink-data-init` container, which chowns the volume;
+   - added a wrapper entrypoint that strips comments, and kept values free of spaces;
+   - left `MAVEN_CONFIG` unset and passed `-Dmaven.repo.local` instead.
+
+### How we verified the work
+- `docker compose --profile build run --rm flink-jobs-build`: **2 tests, 0 failures**, BUILD SUCCESS. The 24 MB shaded jar contains kafka-clients 4.2.0.
+- `docker compose up -d && ./scripts/wait_for_stack.sh` from fresh containers: **ready in about 32 s** (one measurement).
+- `REST /jobmanager/config` shows every repository setting live (RocksDB, the checkpoint dir, `EXACTLY_ONCE`, `RETAIN_ON_CANCELLATION`, `exponential-delay`, 2 slots).
+- `./scripts/smoke_test.sh`: **PASS**. 500/500 records counted, checkpoints `chk-1` and `chk-2` completed (5 s interval override), committed offsets = 500, checkpoint retained after cancel. Run time about 44 s.
+- **Idempotency:** a second `up` re-ran all init services; no topics were created, and Flyway reported "Schema is up to date".
+- **Durability:** after `docker compose down` and `up` (containers destroyed), Kafka still held 500 smoke records, `flyway_schema_history` showed v001, the database timezone was UTC, and all retained checkpoints still had `_metadata`.
+- **Clean room:** `docker compose down -v`, delete all build output, then start, build and smoke-test with no manual steps: **PASS in about 1 min 24 s**.
+- **Topic configs as stored by the broker:** raw has 3 partitions, RF 1, `retention.ms=604800000`, `retention.bytes=2147483648` and `compression.type=producer`.
+
+### Production perspective
+- Kafka would be three or more brokers with RF 3 and `min.insync.replicas=2`, plus a dedicated controller quorum. TLS and SASL with ACLs would replace PLAINTEXT.
+- Flink would run on Kubernetes with the Flink Operator, JobManager HA and checkpoints in object storage.
+- Secrets would come from a secret manager, not `.env`.
+- Startup ordering would be handled by readiness probes and operators, and provisioning (topics, migrations) would run in CI/CD with review, not on every `up`.
+
+### Key takeaways
+1. Verify the riskiest assumption, here version compatibility, with the smallest possible end-to-end test before building on it.
+2. Read the images you depend on (entrypoints, users, paths). Most of this phase's traps were visible there before they caused damage.
+3. A test that passes can still be wrong. Check *what* it verified, not just that it said PASS. Run from a clean room, because state left over from earlier runs hides bugs.
+4. Prefer explicit readiness rules over tools whose semantics don't fit (`--wait` with init containers).
+5. Idempotency and durability are claims, and both were tested: re-run everything, destroy the containers, check again.

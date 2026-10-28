@@ -1,16 +1,17 @@
 # StreamPulse — Architecture
 
-> **Document status:** Phase 0 (design). **Nothing below is implemented yet** unless a section is marked ✅ *Implemented*.
+> **Document status:** Phase 1 complete (local infrastructure). Sections are 📐 *designed* unless marked ✅ *Implemented*.
 > Status markers: ✅ Implemented · 🧪 Implemented, pending measurement · 📐 Designed (planned) · ❓ Open question.
 >
 > Every claim is labelled where it matters: **FACT** (documentation or direct observation), **DECISION** (our choice), **ASSUMPTION** (needs measurement), **EXPERIMENT** (scheduled test).
 >
-> Last updated: 2026-10-26 (Phase 0).
+> Last updated: 2026-10-27 (Phase 1).
 
 ## Contents
 1. [Overview and engineering objectives](#1-overview-and-engineering-objectives)
 2. [Implementation status](#2-implementation-status)
 3. [High-level architecture](#3-high-level-architecture)
+   - 3.1 [Local platform](#31-local-platform)
 4. [The source: Wikimedia EventStreams](#4-the-source-wikimedia-eventstreams)
 5. [Producer](#5-producer)
 6. [Kafka topology](#6-kafka-topology)
@@ -57,7 +58,7 @@ Non-goals for V1: ML, multi-region deployment, Kubernetes, and serving raw event
 | Component | Status | Phase |
 |---|---|---|
 | Research, ADRs, roadmap | ✅ Implemented (documents) | 0 |
-| Docker Compose: Kafka, Flink, PostgreSQL, init jobs | 📐 | 1 |
+| Docker Compose: Kafka, Flink, PostgreSQL, init jobs, smoke test | ✅ Implemented | 1 |
 | Python producer (live, replay, record) | 📐 | 2 |
 | Flink parsing, validation, DLQ, watermarks, dedup, lateness | 📐 | 3 |
 | PostgreSQL schema, upsert sink, core analytics, local Grafana | 📐 | 3 |
@@ -109,6 +110,53 @@ flowchart LR
 **Control and telemetry path:** each component exposes metrics that Prometheus pulls. Grafana reads both Prometheus (operations) and PostgreSQL (analytics). Telemetry never travels on the data path, so a broken pipeline stays observable.
 
 **Why this shape?** Kafka decouples a volatile external source from our processing. The producer's only job is to make the source durable, and everything downstream can be rebuilt from `raw`. This is the core idea: **an immutable, replayable log as the system of record**.
+
+### 3.1 Local platform
+
+✅ Implemented in Phase 1 ([`docker-compose.yml`](../docker-compose.yml)). Verified by `scripts/smoke_test.sh` (PASS) and by destroying and recreating all containers.
+
+**Services:**
+
+| Service | Image (pinned) | Kind | Role | Host port | Memory limit |
+|---|---|---|---|---|---|
+| `kafka` | `apache/kafka:4.2.2` | long-running | single-node KRaft broker and controller | `127.0.0.1:9094` | 1 GiB (heap 768 MB) |
+| `kafka-init` | same | one-shot | creates the 3 topics and enforces their configs ([`create-topics.sh`](../infra/kafka/create-topics.sh)) | — | — |
+| `postgres` | `postgres:18.6-bookworm` | long-running | serving database | `127.0.0.1:5432` | 512 MiB |
+| `db-migrate` | `flyway/flyway:13.10.0-alpine` | one-shot | applies [`database/migrations`](../database/migrations/) | — | — |
+| `flink-data-init` | `flink:2.2.1-scala_2.12-java17` | one-shot | creates checkpoint/savepoint dirs owned by uid 9999 | — | — |
+| `flink-jobmanager` | same | long-running | cluster coordinator, REST API and UI, checkpoint coordinator | `127.0.0.1:8081` | 1.5 GiB (process 1200 MB) |
+| `flink-taskmanager` | same | long-running | runs operators; 2 task slots; RocksDB state | — | 2.5 GiB (process 2048 MB) |
+| `flink-jobs-build` | `maven:3.9.16-eclipse-temurin-17` | tool (profile `build`) | builds and tests the job jar; no host JDK needed | — | — |
+
+**Startup order.** Dependencies are explicit health or completion conditions, never sleeps:
+```mermaid
+flowchart LR
+    K[kafka] -- healthy --> KI[kafka-init]
+    P[postgres] -- healthy --> M[db-migrate]
+    FI[flink-data-init] -- completed --> JM[flink-jobmanager]
+    JM -- healthy --> TM[flink-taskmanager]
+```
+- Health checks: Kafka answers `kafka-broker-api-versions`; PostgreSQL answers `pg_isready`; the JobManager's REST `/overview` responds; the TaskManager counts as healthy once it appears in the JobManager's `/taskmanagers`.
+- `scripts/wait_for_stack.sh` (called by `make up`) waits until long-running services are `healthy` and one-shot services have exited 0. `docker compose up --wait` is **not** used, because it reports a successfully exited init container as a failure, so its result depends on timing (observed, see the learning journal).
+- A fresh start to fully ready takes about 32 s. A clean-room run (fresh volumes, build from source, smoke test) takes about 1 min 24 s with a warm Maven cache. Both were measured once on the dev machine.
+
+**State that must survive container loss** lives in named volumes:
+
+| Volume | Mounted at | Contents |
+|---|---|---|
+| `kafka-data` | `/var/lib/kafka/data` | topic logs and KRaft metadata |
+| `postgres-data` | `/var/lib/postgresql` | database. PostgreSQL 18 images keep data in `/var/lib/postgresql/18/docker`; mounting the ≤17 path `/var/lib/postgresql/data` would leave the real data in an anonymous volume |
+| `flink-data` | `/flink-data` (JobManager and TaskManager) | `checkpoints/<job-id>/chk-N/`, `shared/`, `taskowned/`; `savepoints/` |
+
+**How Flink gets its configuration:**
+- The repository holds [`infra/flink/flink-properties.yaml`](../infra/flink/flink-properties.yaml) (flat `key: value` lines).
+- [`entrypoint.sh`](../infra/flink/entrypoint.sh) strips comments and exports it as `FLINK_PROPERTIES`, then runs the image's own entrypoint, which writes each key into `conf/config.yaml` (as `-D` overrides).
+- Verified through the REST endpoint `/jobmanager/config`.
+- Why not mount a `config.yaml`? The image's entrypoint *writes* to the config file at startup, so a mounted repository file would be modified or would fail as read-only.
+
+**Ports are bound to `127.0.0.1` only**, so nothing is reachable from other machines on the network.
+
+**Job deployment (Phase 1):** a session cluster. The jar is built into `flink-jobs/dist/` and mounted read-only into the JobManager, then submitted with `flink run -d`. The `dist/` directory is committed (`.gitkeep`). If a bind-mount source is missing, Docker creates it owned by root, which would block later non-root builds. The Phase 5 failure tests may move to application mode.
 
 ## 4. The source: Wikimedia EventStreams
 
@@ -173,7 +221,7 @@ flowchart LR
 
 ## 6. Kafka topology
 
-📐 Phase 1. Decision: [ADR-0004](adr/0004-kafka-topic-topology.md).
+✅ Topics, partitions and configs implemented in Phase 1 ([`create-topics.sh`](../infra/kafka/create-topics.sh), idempotent). 📐 Producers and consumers arrive in Phases 2–3. Decision: [ADR-0004](adr/0004-kafka-topic-topology.md).
 
 | Topic | Key | Partitions | Retention | Consumers |
 |---|---|---|---|---|
@@ -188,6 +236,10 @@ flowchart LR
   - **FACT:** Flink's `KafkaSource` **assigns partitions itself** and stores offsets in *Flink checkpoints*. The `group.id` is used only to commit offsets back to Kafka on checkpoint completion, for monitoring.
   - Recovery never uses committed offsets.
 - **Local broker:** single-node KRaft (combined broker and controller), replication factor 1, `min.insync.replicas=1`. Production: three or more brokers, RF=3, `min.insync.replicas=2`, and a separate controller quorum.
+- **Listeners (✅):** `INTERNAL://kafka:9092` for containers, `EXTERNAL://localhost:9094` for host tools, `CONTROLLER://kafka:9093` for KRaft. A client receives the *advertised* address in metadata and reconnects to it. That is why containers and the host need different listeners.
+- **`auto.create.topics.enable=false` (✅):** a misspelled topic name fails loudly instead of silently creating a new topic with default settings.
+- **Topic names use only dots (FACT):** Kafka warns that `.` and `_` collide in metric names, so a name should use one or the other, never both.
+- **Observed (✅, smoke test):** with checkpointing on, the consumer group's committed offsets reached the topic's end offsets only after a checkpoint completed. That matches the FACT above.
 
 **If Kafka fails:**
 - The producer buffers, then applies backpressure to upstream reading, and resumes later from upstream history.
@@ -399,7 +451,15 @@ spike_events(spike_id PK /* hash(wiki,title,window_end) */, wiki_id, title, wind
 
 ## 16. Checkpointing and recovery
 
-📐 Phases 1 and 5. Decision: [ADR-0009](adr/0009-state-backend-and-checkpoint-storage.md).
+✅ Backend, storage and configuration implemented and verified in Phase 1. 📐 Interval tuning and crash tests come in Phase 5. Decision: [ADR-0009](adr/0009-state-backend-and-checkpoint-storage.md).
+
+**Verified in Phase 1 (smoke test):**
+- RocksDB keyed state works on the TaskManager.
+- Checkpoints complete and land in `/flink-data/checkpoints/<job-id>/chk-N/_metadata`. `shared/` holds incremental SST files referenced by several checkpoints, and `taskowned/` holds state owned by tasks.
+- Checkpoints are **retained after cancellation**.
+- All of it survives `docker compose down` and `up`.
+- A job-level override (`flink run -Dexecution.checkpointing.interval=5s`) takes precedence over the cluster default. The smoke test uses this to get checkpoints quickly.
+- Unit level: [`CountRecordsTest`](../flink-jobs/src/test/java/io/github/arttgrantollii/streampulse/smoke/CountRecordsTest.java) snapshots keyed state, restores it into a fresh operator, and checks that counting continues (2 → 3), which is recovery in miniature.
 
 **Checkpoint barriers:**
 - The JobManager's checkpoint coordinator injects barrier *n* into every source.
@@ -503,8 +563,9 @@ p50/p95/p99 are reported for each.
 
 ## 19. Security and configuration
 
-📐 Phase 1.
-- Configuration through environment variables. `.env.example` is committed and `.env` is gitignored. There are no credentials in code, Compose files or images.
+✅ Configuration hygiene implemented in Phase 1. 📐 PostgreSQL roles come in Phase 3.
+- Configuration through environment variables. `.env.example` is committed and `.env` is gitignored. There are no credentials in code, Compose files or images. Compose fails fast (`${VAR:?}`) if a required variable is missing.
+- Flyway's `clean` command (drop every object in the schema) is disabled with `FLYWAY_CLEAN_DISABLED=true`, so it can't be run against this database by accident. Telemetry is disabled (`REDGATE_DISABLE_TELEMETRY`).
 - Separate PostgreSQL roles (Phase 3): a migration owner, a sink writer (DML on result tables only) and a Grafana reader (read-only). Least privilege, even locally.
 - Kafka uses PLAINTEXT locally, which is documented as a local-only shortcut. Production would use TLS plus SASL (SCRAM or OAuth) with ACLs per principal.
 - Services are exposed only on localhost ports.
@@ -552,7 +613,7 @@ ADRs: [index](adr/README.md). Versions: [COMPATIBILITY.md](COMPATIBILITY.md). Ro
 
 ## 23. Repository structure
 
-📐 Target. Directories are created in the phase that first needs them.
+Items marked ✅ exist. The rest is the target; directories are created in the phase that first needs them.
 ```text
 streampulse/
 ├── producer/                 # Python: live | replay | record (Phase 2)
@@ -560,15 +621,15 @@ streampulse/
 │   ├── tests/
 │   ├── pyproject.toml
 │   └── Dockerfile
-├── flink-jobs/               # Java 17, Maven (Phase 1 smoke job; Phase 3+ analytics)
-│   ├── src/main/java/io/github/arttgrantollii/streampulse/
-│   ├── src/test/java/...
-│   ├── pom.xml
-│   └── Dockerfile
+├── flink-jobs/               # ✅ Java 17, Maven. Phase 1 smoke job; Phase 3+ analytics
+│   ├── src/main/java/io/github/arttgrantollii/streampulse/smoke/   # ✅ SmokeJob, CountRecords
+│   ├── src/test/java/...                                           # ✅ operator-harness tests
+│   ├── dist/                                                       # ✅ built job jar (mounted into the JobManager)
+│   └── pom.xml                                                     # ✅
 ├── infra/
-│   ├── kafka/create-topics.sh   # idempotent topic init
-│   └── flink/config.yaml        # cluster configuration
-├── database/migrations/      # Flyway V001__*.sql …
+│   ├── kafka/create-topics.sh       # ✅ idempotent topic init
+│   └── flink/                       # ✅ flink-properties.yaml + entrypoint.sh
+├── database/migrations/      # ✅ Flyway V001__baseline.sql …
 ├── monitoring/
 │   ├── prometheus/prometheus.yml
 │   └── grafana/{provisioning,dashboards}/
@@ -576,15 +637,15 @@ streampulse/
 │   ├── wikimedia/recentchange-1.0.1.yaml   # vendored upstream contract
 │   └── streampulse/{dlq-record,late-record}.v1.json
 ├── sample-data/              # small committed fixtures only; large recordings gitignored
-├── scripts/                  # smoke_test, failure_test, research/
+├── scripts/                  # ✅ smoke_test.sh, wait_for_stack.sh, research/; failure_test (Phase 5)
 ├── tests/e2e/                # cross-component tests (replay → Kafka → Flink → PostgreSQL)
 ├── docs/
 │   ├── ARCHITECTURE.md  INTERVIEW_QUESTIONS.md  LEARNING_JOURNAL.md
 │   ├── ROADMAP.md  COMPATIBILITY.md
 │   ├── adr/  research/  runbooks/  images/
-├── docker-compose.yml
-├── .env.example
-├── Makefile
+├── docker-compose.yml        # ✅
+├── .env.example              # ✅
+├── Makefile                  # ✅
 ├── README.md
 └── LICENSE
 ```

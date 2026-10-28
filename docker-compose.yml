@@ -1,0 +1,186 @@
+# StreamPulse local platform.
+#
+#   docker compose up -d                          # start everything
+#   docker compose --profile build run --rm flink-jobs-build   # build the Flink job jar
+#
+# Every image is pinned to an exact version (docs/COMPATIBILITY.md). One-shot
+# init containers (kafka-init, db-migrate, flink-data-init) do the setup that
+# would otherwise be manual, and dependants wait for them to succeed.
+
+name: ${COMPOSE_PROJECT_NAME:-streampulse}
+
+x-flink-common: &flink-common
+  image: flink:2.2.1-scala_2.12-java17
+  # Wrapper that loads infra/flink/flink-properties.yaml into FLINK_PROPERTIES before
+  # handing over to the image's own entrypoint.
+  entrypoint: ["/opt/streampulse/flink-config/entrypoint.sh"]
+  environment:
+    JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
+  volumes:
+    - ./infra/flink:/opt/streampulse/flink-config:ro
+    - flink-data:/flink-data
+  restart: unless-stopped
+
+services:
+  kafka:
+    image: apache/kafka:4.2.2
+    hostname: kafka
+    environment:
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:?set KAFKA_CLUSTER_ID in .env}
+      KAFKA_NODE_ID: 1
+      # Combined mode: this single node is both broker and KRaft controller.
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # INTERNAL: other containers (kafka:9092). EXTERNAL: tools on the host (localhost:9094).
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:${KAFKA_HOST_PORT:-9094}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Single broker: internal topics cannot have more than one replica.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created only by kafka-init, never implicitly by a typo'd client.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx768m
+    ports:
+      - "127.0.0.1:${KAFKA_HOST_PORT:-9094}:9094"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 15s
+      retries: 12
+      start_period: 20s
+    mem_limit: 1g
+    restart: unless-stopped
+
+  kafka-init:
+    image: apache/kafka:4.2.2
+    entrypoint: ["/bin/bash", "/opt/streampulse/kafka/create-topics.sh"]
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+    volumes:
+      - ./infra/kafka:/opt/streampulse/kafka:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+
+  postgres:
+    image: postgres:18.6-bookworm
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      # PostgreSQL 18 images keep data in /var/lib/postgresql/18/docker and declare
+      # the volume at /var/lib/postgresql (not .../data as in <= 17).
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    mem_limit: 512m
+    restart: unless-stopped
+
+  db-migrate:
+    image: flyway/flyway:13.10.0-alpine
+    command: migrate
+    environment:
+      FLYWAY_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      FLYWAY_USER: ${POSTGRES_USER}
+      FLYWAY_PASSWORD: ${POSTGRES_PASSWORD}
+      FLYWAY_SCHEMAS: streampulse
+      FLYWAY_LOCATIONS: filesystem:/flyway/migrations
+      # Fail instead of silently skipping a migration file with a bad name.
+      FLYWAY_VALIDATE_MIGRATION_NAMING: "true"
+      # Wipes all objects; must never be possible against this database.
+      FLYWAY_CLEAN_DISABLED: "true"
+      REDGATE_DISABLE_TELEMETRY: "true"
+    volumes:
+      - ./database/migrations:/flyway/migrations:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # The flink image runs as uid 9999, but a new named volume is owned by root.
+  # This one-shot container creates the checkpoint/savepoint directories with
+  # the right owner before the JobManager and TaskManager start.
+  flink-data-init:
+    image: flink:2.2.1-scala_2.12-java17
+    user: root
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /flink-data/checkpoints /flink-data/savepoints && chown -R flink:flink /flink-data"]
+    volumes:
+      - flink-data:/flink-data
+    restart: "no"
+
+  flink-jobmanager:
+    <<: *flink-common
+    hostname: flink-jobmanager
+    command: jobmanager
+    ports:
+      - "127.0.0.1:${FLINK_UI_HOST_PORT:-8081}:8081"
+    volumes:
+      - ./infra/flink:/opt/streampulse/flink-config:ro
+      - flink-data:/flink-data
+      # Job jars built by flink-jobs-build into flink-jobs/dist (committed, so it always exists
+      # and is owned by you); submitted with `flink run` from this container.
+      - ./flink-jobs/dist:/opt/streampulse/jobs:ro
+    depends_on:
+      flink-data-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/overview > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    mem_limit: 1536m
+
+  flink-taskmanager:
+    <<: *flink-common
+    command: taskmanager
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    healthcheck:
+      # Healthy once this TaskManager has registered with the JobManager.
+      test: ["CMD-SHELL", "curl -sf http://flink-jobmanager:8081/taskmanagers | grep -q '\"id\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    mem_limit: 2560m
+
+  # Build tool, not a service: `docker compose --profile build run --rm flink-jobs-build`.
+  # Builds and tests the Java jobs without needing a JDK or Maven on the host.
+  flink-jobs-build:
+    image: maven:3.9.16-eclipse-temurin-17
+    profiles: ["build"]
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    working_dir: /workspace
+    environment:
+      # The host uid has no home directory inside the image; give Maven a writable one.
+      # (MAVEN_CONFIG is deliberately not set: the mvn launcher would treat it as CLI args.)
+      HOME: /tmp
+    # Dependencies are cached in flink-jobs/.m2 (gitignored) so rebuilds are fast.
+    command: ["mvn", "-B", "-ntp", "-Dmaven.repo.local=/workspace/.m2/repository", "verify"]
+    volumes:
+      - ./flink-jobs:/workspace
+
+volumes:
+  kafka-data:
+  postgres-data:
+  flink-data:

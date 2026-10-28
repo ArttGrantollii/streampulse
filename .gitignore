@@ -19,8 +19,9 @@ __pycache__/
 htmlcov/
 *.egg-info/
 
-# Java / Maven
+# Java / Maven (flink-jobs/dist is kept via .gitkeep; built jars are not committed)
 target/
+flink-jobs/dist/*.jar
 *.class
 dependency-reduced-pom.xml
 
@@ -30,3 +31,6 @@ dependency-reduced-pom.xml
 *.iml
 .DS_Store
 Thumbs.db
+
+# Local Maven repository used by the containerised build
+flink-jobs/.m2/

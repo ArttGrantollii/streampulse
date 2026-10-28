@@ -29,12 +29,12 @@ The first draft had 12 phases. It was cut to **6** to make sure the project ship
 ## Phase 0 — Research & architecture ✅
 - **Delivered:** research with live-data evidence, a version baseline, 13 ADRs, the architecture, this roadmap and the living docs.
 
-## Phase 1 — Infrastructure foundation 🔜
+## Phase 1 — Infrastructure foundation ✅
 - **Goal:** `docker compose up -d` brings up Kafka (KRaft), a Flink JobManager and TaskManager, and PostgreSQL. Topics and migrations are created automatically, and a Java smoke job proves Flink 2.2.1 can read Kafka 4.2.2 and checkpoint durably.
 - **Learned:** KRaft, listeners, topic configuration, Flink session clusters and slots, health checks, named volumes, and Flyway migrations.
-- **Acceptance:** see [§ Phase 1 acceptance criteria](#phase-1-acceptance-criteria).
+- **Acceptance:** see [§ Phase 1 acceptance criteria](#phase-1-acceptance-criteria). All 10 were met on 2026-10-27, except that `make` itself awaits installation on the dev machine (the Makefile targets wrap commands that were each run and verified directly).
 
-## Phase 2 — Ingestion ⏳
+## Phase 2 — Ingestion 🔜
 - **Goal:** a Python producer with `live`, `replay` and `record` modes sharing one publishing path.
   - Live mode: SSE parsing, reconnects with jittered backoff, and resume ([ADR-0012](adr/0012-producer-resume-from-kafka.md)).
   - Kafka producer settings: idempotence, `acks=all`, zstd, and the murmur2 partitioner.

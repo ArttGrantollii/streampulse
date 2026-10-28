@@ -1,0 +1,35 @@
+# StreamPulse Flink cluster configuration (Flink 2.2 option keys).
+#
+# Not a file Flink reads directly: Flink 2.x reads conf/config.yaml (the 1.x
+# flink-conf.yaml is gone). entrypoint.sh loads this file into FLINK_PROPERTIES,
+# and the image's entrypoint writes each key into conf/config.yaml.
+# Format: one flat `key: value` per line.
+# Whitespace inside values is stripped by the image, so values must not contain
+# spaces. Rationale for each value: docs/adr/0009-state-backend-and-checkpoint-storage.md
+
+# --- Resources (sized for a ~8 GB Docker Desktop VM; container limits in docker-compose.yml)
+jobmanager.memory.process.size: 1200m
+taskmanager.memory.process.size: 2048m
+taskmanager.numberOfTaskSlots: 2
+parallelism.default: 2
+
+# --- State backend: RocksDB with incremental checkpoints
+state.backend.type: rocksdb
+execution.checkpointing.incremental: true
+
+# --- Checkpoint and savepoint storage on the shared flink-data volume
+execution.checkpointing.dir: file:///flink-data/checkpoints
+execution.checkpointing.savepoint-dir: file:///flink-data/savepoints
+
+# --- Checkpointing (initial values; tuned with measurements in Phase 5)
+execution.checkpointing.interval: 30s
+execution.checkpointing.mode: EXACTLY_ONCE
+execution.checkpointing.timeout: 2min
+execution.checkpointing.min-pause: 10s
+execution.checkpointing.max-concurrent-checkpoints: 1
+execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+execution.checkpointing.num-retained: 3
+execution.checkpointing.tolerable-failed-checkpoints: 3
+
+# --- Failure recovery
+restart-strategy.type: exponential-delay

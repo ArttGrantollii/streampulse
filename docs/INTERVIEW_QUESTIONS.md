@@ -16,6 +16,10 @@ Difficulty: **Fundamental** (do you understand the concept?) · **Intermediate**
   - [Delivery semantics](#delivery-semantics)
   - [Observability](#observability)
   - [Product and presentation](#product-and-presentation)
+- [Phase 1 — Infrastructure foundation](#phase-1--infrastructure-foundation)
+  - [Kafka in KRaft mode](#kafka-in-kraft-mode)
+  - [Flink, Kafka offsets and checkpoints](#flink-kafka-offsets-and-checkpoints)
+  - [Platform engineering](#platform-engineering)
 - [Senior-level system design scenarios](#senior-level-system-design-scenarios)
 
 ---
@@ -405,6 +409,171 @@ Managed Kafka and Flink (or Kubernetes with the Flink Operator and JobManager HA
 
 ---
 
+## Phase 1 — Infrastructure foundation
+
+### Kafka in KRaft mode
+
+**Question:** What is KRaft, and what does running Kafka in "combined mode" mean in StreamPulse?
+
+**Difficulty:** Fundamental / Intermediate
+
+**Interview-ready answer:**
+KRaft is Kafka's built-in Raft consensus for cluster metadata. Topics, partitions, leaders and configs are stored in an internal metadata log, replicated across a quorum of *controller* nodes. Before KRaft, Kafka needed a separate ZooKeeper ensemble for this. Kafka 4.x is KRaft-only. StreamPulse runs one node with `process.roles=broker,controller`, so the same JVM serves client traffic and is the entire controller quorum. That's fine for local development, but in production you'd run three or five dedicated controllers, so a broker under heavy load can't destabilise metadata management.
+
+**Deep technical explanation:**
+The controller quorum elects a leader with Raft. Brokers fetch the metadata log from it and apply changes. A `CLUSTER_ID` identifies the cluster, and the storage directory is formatted with it on first start. That's why the image refuses to start in KRaft mode without one, and why it's fixed in `.env` rather than random per start: a new ID wouldn't match the already-formatted volume. With a single controller there's no fault tolerance for metadata at all. A quorum of three tolerates one failure, and five tolerates two.
+
+**How StreamPulse demonstrates this:**
+The `kafka` service in [`docker-compose.yml`](../docker-compose.yml) sets `KAFKA_PROCESS_ROLES`, `KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093` and `CLUSTER_ID`. The data in the `kafka-data` volume survived `docker compose down` and `up` with the same ID.
+
+**Potential follow-up question:**
+Why set the internal topics' replication factor to 1 explicitly?
+
+**Follow-up answer:**
+Internal topics such as `__consumer_offsets` and the transaction log default to RF 3. On a single broker they can't be created, so consumer groups or transactions would fail at first use, not at startup, which is a confusing delayed failure. Setting them to 1 is correct for one broker. In production they should be 3, with `min.insync.replicas=2`.
+
+---
+
+**Question:** Why does the Kafka container define three listeners, and what is an "advertised" listener?
+
+**Difficulty:** Intermediate
+
+**Interview-ready answer:**
+A Kafka client first connects to a bootstrap address, but then uses the broker addresses returned in *metadata* for all real traffic. Those returned addresses are the advertised listeners. Containers must be told `kafka:9092`, a Docker DNS name, while tools on my laptop must be told `localhost:9094`, because `kafka` doesn't resolve on the host. So there is an INTERNAL listener for containers, an EXTERNAL one for the host, and a CONTROLLER listener for KRaft traffic. The classic symptom of getting this wrong is a client that connects to the bootstrap address, then hangs or times out connecting to an address it can't reach.
+
+**Deep technical explanation:**
+`listeners` is where the broker binds (`0.0.0.0:port`). `advertised.listeners` is what it tells clients. `listener.security.protocol.map` assigns a protocol to each named listener, and `inter.broker.listener.name` chooses which one brokers use to talk to each other. The host port is bound to `127.0.0.1` only, so nothing outside the laptop can reach the broker, which matters because it's PLAINTEXT.
+
+**How StreamPulse demonstrates this:**
+The `KAFKA_LISTENERS` and `KAFKA_ADVERTISED_LISTENERS` settings in [`docker-compose.yml`](../docker-compose.yml). The Flink job uses `kafka:9092`. Host tooling (the Phase 2 producer during development) will use `localhost:9094`.
+
+**Potential follow-up question:**
+How would this look in production?
+
+**Follow-up answer:**
+One listener per network zone (internal VPC, cross-VPC or peering, maybe a public endpoint), each with TLS and SASL authentication, and ACLs per principal. Advertised hostnames must resolve from wherever each client runs, which is a common source of trouble with Kubernetes and cloud load balancers.
+
+---
+
+### Flink, Kafka offsets and checkpoints
+
+**Question:** After a crash, where does Flink's Kafka source resume from: the consumer group's committed offsets, or something else?
+
+**Difficulty:** Advanced
+
+**Interview-ready answer:**
+From the offsets stored *in the Flink checkpoint* it restores. The Kafka connector docs are explicit that the source doesn't rely on committed offsets for fault tolerance. It commits offsets back to Kafka only when a checkpoint completes, purely so external tools can see progress. My smoke test shows this: after the job had counted all 500 records, the group's committed offsets reached 500 (lag 0) only once a checkpoint had completed.
+
+**Deep technical explanation:**
+The source's split state, meaning partition plus offset, is part of the checkpoint, taken consistently with every other operator's state at the barrier. On recovery, all operators restore checkpoint *n* and the source rewinds to the offsets recorded in *n*. That is what makes state exactly-once: state and input position always come from the same consistent cut. If recovery used committed offsets instead, they could be ahead of or behind the restored state. This is also why consumer-group lag for a Flink job looks like a sawtooth that moves with the checkpoint interval.
+
+**How StreamPulse demonstrates this:**
+[`scripts/smoke_test.sh`](../scripts/smoke_test.sh) waits until offsets committed by group `streampulse-smoke` sum to N, after checkpoints complete. The job is [`SmokeJob`](../flink-jobs/src/main/java/io/github/arttgrantollii/streampulse/smoke/SmokeJob.java).
+
+**Potential follow-up question:**
+When *are* committed offsets used by Flink?
+
+**Follow-up answer:**
+They're used when a job starts *without* restoring state, if it's configured with `OffsetsInitializer.committedOffsets(...)`. For example, after a deliberate fresh deploy you might want to continue roughly where the previous job stopped. The smoke job uses `earliest()` because its topic is recreated each run. Without checkpointing at all, the source falls back to the Kafka client's auto-commit.
+
+---
+
+**Question:** What is actually inside a Flink checkpoint directory, and why must the JobManager and TaskManagers share it?
+
+**Difficulty:** Intermediate / Advanced
+
+**Interview-ready answer:**
+Each job gets a directory with:
+- `chk-N` folders, one per retained checkpoint, each with a `_metadata` file written by the JobManager that describes the whole checkpoint;
+- `shared/`, where incremental RocksDB checkpoints keep SST files that several checkpoints reference;
+- `taskowned/`, for state owned by the tasks themselves.
+
+TaskManagers write the state files and the JobManager writes the metadata pointing to them, so both need the same path. In StreamPulse that's a named Docker volume mounted into both containers.
+
+**Deep technical explanation:**
+With incremental checkpoints, checkpoint *n* uploads only the SST files that are new since *n−1*. `_metadata` references files in `shared/`, which Flink reference-counts, so an SST file is deleted only when no retained checkpoint uses it. This is why you can't delete "old" files from `shared/` by hand. In production the shared path is object storage (S3, ADLS, GCS), because a local disk is neither shared nor durable across hosts.
+
+**How StreamPulse demonstrates this:**
+The smoke test lists `chk-1`, `chk-2`, `shared` and `taskowned` on the `flink-data` volume, and checks that `_metadata` still exists after the job is cancelled (`RETAIN_ON_CANCELLATION`). Rationale is in [ADR-0009](adr/0009-state-backend-and-checkpoint-storage.md).
+
+**Potential follow-up question:**
+What's the difference between a retained checkpoint and a savepoint, if both survive cancellation?
+
+**Follow-up answer:**
+A retained checkpoint is Flink-owned, possibly incremental, in the backend's native format, and managed by retention settings. It exists for recovery. A savepoint is user-triggered and user-owned, never deleted automatically, and meant for planned operations: upgrades, rescaling, migrations. You can restore from a retained checkpoint in an emergency, but you plan operations around savepoints.
+
+---
+
+### Platform engineering
+
+**Question:** How does StreamPulse make sure topics, schemas and directories exist before services need them, without manual steps?
+
+**Difficulty:** Intermediate
+
+**Interview-ready answer:**
+With one-shot init containers gated by health checks:
+- `kafka-init` waits for Kafka to be healthy, then creates the topics with `--if-not-exists` and re-applies their configs;
+- `db-migrate` waits for PostgreSQL, then runs Flyway;
+- `flink-data-init` fixes volume ownership before Flink starts.
+
+Each is idempotent, so running it again changes nothing, which I verified by re-running all three. I deliberately didn't use `docker compose up --wait`. It treats a successfully exited init container as a failure, and I saw it return exit code 0 on one run and 1 on the next with the same stack. So `make up` uses a small script that checks long-running services for `healthy` and init services for exit code 0.
+
+**Deep technical explanation:**
+Health checks should test *readiness for the dependant's purpose*: for example, the TaskManager is healthy once it has registered with the JobManager, not merely once its process has started. Sleeps encode a guess about timing, and dependency conditions encode the actual requirement. Idempotent init lets the same command converge any state: a fresh machine, a partial failure, or config drift.
+
+**How StreamPulse demonstrates this:**
+[`docker-compose.yml`](../docker-compose.yml) (`depends_on` conditions), [`create-topics.sh`](../infra/kafka/create-topics.sh), [`wait_for_stack.sh`](../scripts/wait_for_stack.sh). I tested the failure path with a deliberately broken migration, and the script printed Flyway's error and exited 1.
+
+**Potential follow-up question:**
+Why does `create-topics.sh` fail on a partition-count mismatch instead of fixing it?
+
+**Follow-up answer:**
+Partitions can be added but never removed, and adding them changes `hash(key) % partitions`. That remaps keys and breaks per-key ordering across the change. That decision needs a human, so the script stops loudly. Retention and compression are safe to re-apply, so it does.
+
+---
+
+**Question:** Why use Flyway migrations instead of the PostgreSQL image's init scripts?
+
+**Difficulty:** Intermediate
+
+**Interview-ready answer:**
+The image's `docker-entrypoint-initdb.d` scripts run only when the data directory is empty, so they can't evolve an existing database. Flyway applies numbered migrations in order and records each one in `flyway_schema_history`, so every environment converges to the same version and schema changes are reviewable code. I also disabled `clean` so the "drop everything" command can't run by accident.
+
+**Deep technical explanation:**
+PostgreSQL has transactional DDL. When I tested a deliberately broken migration, Flyway reported "Changes successfully rolled back", and the history still showed only v001. Many databases (e.g. MySQL) auto-commit DDL, so a failed migration can leave a half-applied schema. The baseline migration also sets the database timezone to UTC, so event-time windows read the same from every client.
+
+**How StreamPulse demonstrates this:**
+[`database/migrations/V001__baseline.sql`](../database/migrations/V001__baseline.sql) and the `db-migrate` service.
+
+**Potential follow-up question:**
+How do you handle a migration that must change a large table without downtime?
+
+**Follow-up answer:**
+Use expand and contract. Add the new column or table in a backwards-compatible migration, deploy code that writes both versions, backfill in batches, switch reads, then drop the old structure in a later migration. Build indexes with `CREATE INDEX CONCURRENTLY`, which can't run inside a transaction, so that migration has to be marked non-transactional.
+
+---
+
+**Question:** In the Flink job's build, what goes into the jar and what doesn't, and why?
+
+**Difficulty:** Intermediate / Advanced
+
+**Interview-ready answer:**
+Flink's own APIs (`flink-streaming-java`, `flink-clients`) and SLF4J are `provided`: the cluster already has them in `lib/`, and packaging a second copy risks class conflicts. Connectors are *not* part of the Flink distribution, so the Kafka connector and its `kafka-clients` 4.2.0 are shaded into the uber-jar. The shade plugin also merges `META-INF/services` files, because connectors register themselves through Java's ServiceLoader. Without merging, one connector's registration silently overwrites another's.
+
+**Deep technical explanation:**
+I hit this for real. Flink 2.2's POMs don't pass `slf4j-api` through to job projects, so the first build failed with "package org.slf4j does not exist". The fix is to declare it `provided`, matching the runtime's 1.7.36, rather than bundling a logging implementation. For tests, I use the same binding the image ships (`log4j-slf4j-impl`) and the JUnit and AssertJ versions Flink's test utilities are built on, rather than the newest JUnit 6, which could conflict with them.
+
+**How StreamPulse demonstrates this:**
+[`flink-jobs/pom.xml`](../flink-jobs/pom.xml). The shaded jar is about 24 MB.
+
+**Potential follow-up question:**
+What would break if you shaded Flink itself into the jar?
+
+**Follow-up answer:**
+You'd have two copies of Flink classes in different classloaders. Flink loads user code child-first, so types like `StreamExecutionEnvironment` or state descriptors from your jar wouldn't match the runtime's. That causes `ClassCastException` or `LinkageError` problems that are hard to diagnose. Provided scope keeps one copy, owned by the runtime.
+
+---
+
 ## Senior-level system design scenarios
 
 *These answers reflect the Phase 0 design. They will deepen as each mechanism is implemented and measured.*
@@ -484,3 +653,31 @@ How long would a 7-day rebuild take?
 
 **Follow-up answer:**
 I don't know yet, and I won't guess. At 47 events per second, 7 days is about 28 million events. Rebuild time is that divided by the measured maximum replay throughput from Phase 5.
+
+---
+
+**Question:** Your local platform runs with one command. What would you change to run the same stack in production?
+
+**Difficulty:** Senior
+
+**Interview-ready answer:**
+Almost every "one" becomes "several", and every shortcut gets replaced:
+- **Kafka:** three or more brokers with RF 3 and `min.insync.replicas=2`, plus a separate three- or five-node controller quorum.
+- **Flink:** JobManager HA (Kubernetes HA via the Flink Operator), several TaskManagers, and checkpoints in object storage instead of a Docker volume.
+- **PostgreSQL:** managed, with backups and point-in-time recovery.
+- **Security:** TLS and SASL with ACLs instead of PLAINTEXT, and secrets from a secret manager instead of `.env`.
+- **Readiness checks** become Kubernetes readiness probes, and init containers become operator-managed resources or CI/CD steps.
+
+The *design* stays the same; the *operations* change.
+
+**Deep technical explanation:**
+The things that don't change are what make the design portable: idempotent topic and schema provisioning, explicit health-based dependencies, pinned versions, configuration outside code, and state outside processes. Those are habits, not tools. What changes is the failure domain. Locally, one Docker host is a single point of failure for everything. In production, each component's own replication and HA defines it, and you then need monitoring to tell you when that redundancy is degraded.
+
+**How StreamPulse demonstrates this:**
+The local shortcuts are documented as such: ARCHITECTURE §3.1, §19 and §22, and the cloud mapping in §21. The production equivalents are reasoning, not implementation.
+
+**Potential follow-up question:**
+Which of these would you prioritise if you could only do one?
+
+**Follow-up answer:**
+Durable, replicated storage for the system of record: Kafka with RF 3, and checkpoints in object storage. Compute can be recreated, but lost data can't. JobManager HA is next, because without it a JobManager failure needs manual resubmission.
